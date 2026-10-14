@@ -1,0 +1,80 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.miller'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(22)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    seleniumVersion = '4.51.0'
+    cucumberVersion = '7.34.9'
+    testngVersion = '7.12.0'
+    junitVersion = '5.14.4'
+    restAssuredVersion = '5.5.7'
+    datafakerVersion = '2.7.0'
+    assertjVersion = '3.27.7'
+}
+
+dependencies {
+    // UI
+    testImplementation "org.seleniumhq.selenium:selenium-java:${seleniumVersion}"
+
+    // BDD: Cucumber ejecutado por TestNG, con PicoContainer para DI por escenario
+    testImplementation "io.cucumber:cucumber-java:${cucumberVersion}"
+    testImplementation "io.cucumber:cucumber-testng:${cucumberVersion}"
+    testImplementation "io.cucumber:cucumber-picocontainer:${cucumberVersion}"
+    testImplementation "org.testng:testng:${testngVersion}"
+
+    // API y datos
+    testImplementation "io.rest-assured:rest-assured:${restAssuredVersion}"
+    testImplementation "net.datafaker:datafaker:${datafakerVersion}"
+
+    // Aserciones
+    testImplementation "org.assertj:assertj-core:${assertjVersion}"
+
+    // Unit tests del framework (solo JUnit 5)
+    testImplementation platform("org.junit:junit-bom:${junitVersion}")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Unit tests del propio framework: JUnit 5, solo el paquete unit
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    include '**/unit/**'
+}
+
+// Escenarios BDD: TestNG ejecuta Cucumber a partir de testng.xml
+tasks.register('acceptanceTest', Test) {
+    description = 'Runs the Cucumber BDD scenarios through TestNG.'
+    group = 'verification'
+
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+
+    useTestNG {
+        suites 'src/test/resources/testng.xml'
+    }
+
+    // -Dtags="@api" en la línea de comandos → filtro de Cucumber en la JVM de pruebas
+    def tags = providers.systemProperty('tags').orNull
+    if (tags) {
+        systemProperty 'cucumber.filter.tags', tags
+    }
+
+    outputs.upToDateWhen { false }
+
+    testLogging {
+        events 'passed', 'failed', 'skipped'
+    }
+}
