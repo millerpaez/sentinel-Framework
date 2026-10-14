@@ -65,6 +65,10 @@ tasks.register('acceptanceTest', Test) {
     useTestNG {
         suites 'src/test/resources/testng.xml'
     }
+    // The runner's @Test method is inherited from AbstractTestNGCucumberTests (inside the Cucumber jar),
+    // which Gradle's class scanner does not see. testng.xml already names the class to run.
+    scanForTestClasses = false
+    include '**/runners/**'
 
     // -Dtags="@api" en la línea de comandos → filtro de Cucumber en la JVM de pruebas
     def tags = providers.systemProperty('tags').orNull
