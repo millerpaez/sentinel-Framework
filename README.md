@@ -76,6 +76,40 @@ La primera ejecución descarga Gradle en `~/.gradle/wrapper/dists`; las siguient
 
 ---
 
+## Configuración (`Config`)
+
+### Qué
+`core/config/Config.java` es el único punto de acceso a la configuración. Los valores por defecto viven en `src/test/resources/config.properties`:
+
+| Clave | Valor por defecto | Variable de entorno |
+|---|---|---|
+| `base.url` | `https://automationexercise.com` | `BASE_URL` |
+| `api.base.url` | `https://automationexercise.com/api` | `API_BASE_URL` |
+| `headless` | `false` | `HEADLESS` |
+| `timeout.seconds` | `10` | `TIMEOUT_SECONDS` |
+
+### Orden de precedencia (gana el primero que exista)
+
+1. **System property:** `./gradlew ... -Dheadless=true`
+2. **Variable de entorno:** la clave en mayúsculas y con `.` cambiado por `_` (`headless` → `HEADLESS`)
+3. **`config.properties`**
+
+Si la clave no existe en ninguno de los tres, se lanza `IllegalStateException` con el nombre de la clave. Es mejor fallar de inmediato que seguir con un `null`.
+
+### Por qué así
+- **El mismo código en local y en CI:** en tu Mac se usan los valores del archivo y en GitHub Actions se cambian con `HEADLESS=true`, sin tocar código.
+- **El archivo se lee una sola vez** (inicialización estática) y nadie puede modificarlo después. La clase es `final` y tiene constructor privado, así que no se crean instancias: todo se hace con `Config.get(...)`.
+- **Conversión estricta de tipos:** `getBool` solo acepta `true` o `false` (sin importar mayúsculas). `Boolean.parseBoolean("yes")` devolvería `false` sin avisar, y un error de escritura como `HEADLESS=ture` dejaría el navegador visible en CI sin que nadie lo notara. `getInt` muestra un error que incluye el nombre de la clave.
+
+### Cómo se prueba (`ConfigTest`, JUnit 5)
+Son 9 unit tests: lectura del archivo, system property por encima del archivo, uso de la variable de entorno, system property por encima de la variable de entorno, conversión de `int` y `boolean`, valores inválidos y clave faltante.
+
+- Las variables de entorno no se pueden modificar desde Java. Por eso la prueba usa la clave `home`, que corresponde a la variable `HOME` y existe tanto en macOS como en el runner de CI.
+- `@AfterEach` borra las system properties que cada prueba define, para que ninguna prueba afecte a otra.
+- Las pruebas no dependen del entorno: dan el mismo resultado con `HEADLESS=true` (como en CI).
+
+---
+
 ## Cómo ejecutar localmente (macOS)
 
 **Requisitos:** Java 22, Google Chrome y Git. Gradle **no** hace falta: lo trae el wrapper.
