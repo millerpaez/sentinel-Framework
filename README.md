@@ -602,7 +602,7 @@ sequenceDiagram
     participant S3 as Bucket S3
 
     J->>G: 1. Pide un token (permitido por id-token: write)
-    G-->>J: 2. Token JWT firmado: aud=sts.amazonaws.com,<br/>sub=repo:millerpaez/sentinel-Framework:ref:refs/heads/main
+    G-->>J: 2. Token JWT firmado: aud=sts.amazonaws.com,<br/>sub=repo:millerpaez@78972722/<br/>sentinel-Framework@1419844374:ref:refs/heads/main
     J->>STS: 3. AssumeRoleWithWebIdentity(rol, token)
     STS->>IAM: 4. ¿La trust policy acepta este token?
     Note over STS,IAM: Verifica la firma de GitHub,<br/>que aud y sub coincidan EXACTO
@@ -614,7 +614,7 @@ sequenceDiagram
 1. El step `configure-aws-credentials` pide a GitHub un token OIDC. Solo puede hacerlo porque el workflow tiene `id-token: write`.
 2. GitHub entrega un **JWT** (un JSON firmado digitalmente) con *claims* (datos) sobre quién lo pide. Los dos que importan son:
    - `aud` (audiencia): `sts.amazonaws.com`, es decir, "este token es para AWS".
-   - `sub` (sujeto): `repo:millerpaez/sentinel-Framework:ref:refs/heads/main`, es decir, "soy este repo, en esta rama".
+   - `sub` (sujeto): `repo:millerpaez@78972722/sentinel-Framework@1419844374:ref:refs/heads/main`, es decir, "soy este repo, en esta rama" (ver "Formato del `sub`" más abajo).
 3. El step llama a AWS STS, `AssumeRoleWithWebIdentity`, con el ARN del rol y el token.
 4. AWS revisa la **trust policy** del rol: que la firma sea de GitHub y que `aud` y `sub` coincidan exactamente.
 5. Si todo coincide, STS devuelve credenciales temporales. El step las guarda como variables de entorno y los siguientes pasos del job (el `aws s3 sync`) las usan automáticamente.
@@ -635,7 +635,7 @@ sequenceDiagram
     "Condition": {
       "StringEquals": {                                      // coincidencia EXACTA (distingue mayúsculas)
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:millerpaez/sentinel-Framework:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "repo:millerpaez@78972722/sentinel-Framework@1419844374:ref:refs/heads/main"
       }
     }
   }]
@@ -647,7 +647,24 @@ sequenceDiagram
 - el repo `millerpaez/sentinel-Framework` (no un fork, no otro repo),
 - y solo en la rama `main` (`push` a main, `schedule` y `workflow_dispatch` lanzados desde main).
 
-Un PR genera un `sub` distinto (`repo:millerpaez/sentinel-Framework:pull_request`), así que AWS lo rechazaría. Por eso además los pasos de AWS tienen `if: github.event_name != 'pull_request'`: ni siquiera lo intentan. Esto importa porque un PR puede venir de un desconocido con código malicioso.
+Un PR genera un `sub` distinto (`repo:millerpaez@78972722/sentinel-Framework@1419844374:pull_request`), así que AWS lo rechazaría. Por eso además los pasos de AWS tienen `if: github.event_name != 'pull_request'`: ni siquiera lo intentan. Esto importa porque un PR puede venir de un desconocido con código malicioso.
+
+#### Formato del `sub`: clásico vs. inmutable (lección aprendida)
+GitHub tiene dos formatos para el `sub`:
+
+| Formato | Ejemplo |
+|---|---|
+| Clásico | `repo:millerpaez/sentinel-Framework:ref:refs/heads/main` |
+| **Inmutable** (el que usa este repo) | `repo:millerpaez@78972722/sentinel-Framework@1419844374:ref:refs/heads/main` |
+
+El inmutable agrega el **ID numérico** del dueño (`78972722`) y del repo (`1419844374`). **¿Por qué es más seguro?** Los nombres se pueden reutilizar: si alguien borra o renombra su repo, otra persona podría crear uno con el mismo nombre y su token tendría el mismo `sub` clásico. Los IDs numéricos nunca se reutilizan, así que con el formato inmutable un repo "impostor" con el mismo nombre no puede asumir el rol.
+
+La primera configuración usó el formato clásico y AWS respondió `Not authorized to perform sts:AssumeRoleWithWebIdentity`, porque la comparación es exacta. **Cómo saber qué formato usa un repo:**
+```bash
+gh api repos/millerpaez/sentinel-Framework/actions/oidc/customization/sub
+# {"use_immutable_subject":true,"sub_claim_prefix":"repo:millerpaez@78972722/sentinel-Framework@1419844374", ...}
+```
+El `sub` real es ese `sub_claim_prefix` seguido de `:ref:refs/heads/main` (o `:pull_request`, etc.).
 
 **[`infra/iam/s3-report-policy.json`](infra/iam/s3-report-policy.json): qué puede hacer el rol**
 ```json
@@ -702,6 +719,7 @@ Un PR genera un `sub` distinto (`repo:millerpaez/sentinel-Framework:pull_request
 4. Llena los campos de GitHub:
    - **GitHub organization:** `millerpaez`
    - **GitHub repository:** `sentinel-Framework` (con la **F mayúscula**, exactamente igual)
+   - El asistente puede generar el `sub` en formato clásico. No importa, porque en el punto 7 se reemplaza por el JSON del repo, que usa el formato inmutable.
    - **GitHub branch:** `main`
 5. **Next** → en *Add permissions* **no** marques nada → **Next**.
 6. **Role name:** `sentinel-github-actions` → **Create role**.
@@ -738,6 +756,7 @@ El bucket es **privado**: no hay URL pública. Es intencional (sección 14, road
 ### El workflow, parte AWS
 ```yaml
 - name: Configure AWS credentials (OIDC)
+  id: aws                                             # nombre para referirse a este paso
   if: always() && github.event_name != 'pull_request'
   uses: aws-actions/configure-aws-credentials@v6
   with:
@@ -745,7 +764,7 @@ El bucket es **privado**: no hay URL pública. Es intencional (sección 14, road
     aws-region: us-east-1
 
 - name: Publish Cucumber report to S3
-  if: always() && github.event_name != 'pull_request'
+  if: always() && steps.aws.outcome == 'success'      # solo si el paso anterior obtuvo credenciales
   env:
     REPORT_BUCKET: ${{ secrets.REPORT_BUCKET }}
   run: |
@@ -753,6 +772,7 @@ El bucket es **privado**: no hay URL pública. Es intencional (sección 14, road
     aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/runs/${{ github.run_id }}/"
 ```
 - `if: always()`: el reporte se publica **aunque las pruebas fallen**. Un monitor que solo guarda evidencia de los éxitos no sirve.
+- `steps.aws.outcome == 'success'`: el paso de S3 depende del paso con `id: aws`. Si no hubo credenciales no tiene sentido intentar subir, y así el log muestra un solo error claro en lugar de dos.
 - No hay ninguna llave en el YAML: `role-to-assume` es solo el **nombre** del rol. La "prueba de identidad" es el token OIDC, que la action pide sola.
 - `aws s3 sync` sube solo lo que no existe o cambió. Como cada ejecución usa una carpeta nueva (`runs/<run_id>/`), en la práctica sube todo y nunca sobrescribe ejecuciones anteriores.
 - La AWS CLI ya viene instalada en `ubuntu-latest`.
@@ -764,7 +784,8 @@ Cada reporte pesa unos cientos de KB. Con una ejecución programada al día más
 
 | Error en el log | Causa probable | Arreglo |
 |---|---|---|
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | El `sub` del token no coincide con la trust policy: mayúsculas (`sentinel-Framework`), rama distinta de `main`, o el proveedor OIDC no existe | Revisar el paso 3 y la pestaña *Trust relationships* del rol contra `trust-policy.json` |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | El `sub` del token no coincide con la trust policy: formato clásico vs. inmutable (**fue el error real de la primera ejecución**), mayúsculas, rama distinta de `main`, o el proveedor OIDC no existe | Comparar *Trust relationships* del rol con `trust-policy.json` y con el `sub_claim_prefix` que devuelve `gh api .../oidc/customization/sub` |
+| `Unable to locate credentials` en el paso de S3 | El paso de credenciales falló antes | Ya no aparece: el paso de S3 solo corre si `steps.aws.outcome == 'success'`. Revisar el error del paso anterior |
 | `Credentials could not be loaded` / `Could not get ID token` | Falta `id-token: write` en `permissions` | Verificar el bloque `permissions` del workflow |
 | `Input required and not supplied: role-to-assume` | El secret `AWS_ROLE_ARN` no existe o tiene otro nombre | Paso 6 |
 | `AccessDenied ... s3:PutObject` | La política en línea no está adjunta, o el bucket o la ruta no coinciden | Paso 5; el ARN debe terminar en `/runs/*` |

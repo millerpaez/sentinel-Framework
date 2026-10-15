@@ -11,7 +11,7 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:millerpaez/sentinel-Framework:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:millerpaez@78972722/sentinel-Framework@1419844374:ref:refs/heads/main"
         }
       }
     }

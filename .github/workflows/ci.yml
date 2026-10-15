@@ -58,6 +58,7 @@ jobs:
       # AWS steps run only on main (push, schedule, manual): the IAM role trusts only refs/heads/main,
       # and pull requests (possibly from forks) must never reach AWS.
       - name: Configure AWS credentials (OIDC)
+        id: aws
         if: always() && github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -65,7 +66,8 @@ jobs:
           aws-region: us-east-1
 
       - name: Publish Cucumber report to S3
-        if: always() && github.event_name != 'pull_request'
+        # Only when credentials were obtained; otherwise it would just add a second, misleading error
+        if: always() && steps.aws.outcome == 'success'
         env:
           REPORT_BUCKET: ${{ secrets.REPORT_BUCKET }}
         run: |
