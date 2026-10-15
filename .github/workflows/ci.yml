@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Cron runs in UTC: 00:00, 06:00, 12:00, 18:00 UTC = 19:00, 01:00, 07:00, 13:00 Colombia (UTC-5)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Cucumber tag expression (e.g. "@monitor"). Empty runs every scenario.'
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write # needed later to request the OIDC token for AWS
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java 22
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "22"
+          cache: gradle
+
+      - name: Run unit tests and BDD scenarios
+        env:
+          HEADLESS: "true"
+          # Scheduled runs = synthetic monitor (@monitor); manual runs may pass tags; push/PR run everything
+          TAGS: ${{ github.event_name == 'schedule' && '@monitor' || inputs.tags || '' }}
+        run: |
+          if [ -n "$TAGS" ]; then
+            echo "Running scenarios with tags: $TAGS"
+            ./gradlew test acceptanceTest -Dtags="$TAGS"
+          else
+            ./gradlew test acceptanceTest
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sentinel-reports-${{ github.run_id }}
+          path: build/reports
+          retention-days: 14

@@ -1,5 +1,7 @@
 # Sentinel
 
+[![CI](https://github.com/millerpaez/sentinel-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/millerpaez/sentinel-Framework/actions/workflows/ci.yml)
+
 **Monitor sintético BDD en Java:** ejecuta los flujos críticos de [automationexercise.com](https://automationexercise.com) (UI y API) cada 6 horas, publica los reportes en AWS S3 y deja evidencia de cada fallo.
 
 > 🚧 En construcción por fases. Cada sección se completa cuando termina la fase que la implementa.
@@ -383,3 +385,47 @@ HEADLESS=true ./gradlew test acceptanceTest   # todo, como en CI
 ```
 
 Reporte: abrir `build/reports/cucumber/index.html` en el navegador.
+
+---
+
+## CI (GitHub Actions)
+
+Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). El badge al inicio del README muestra el estado de la última ejecución en `main`.
+
+### Disparadores
+
+| Evento | Cuándo | Qué ejecuta |
+|---|---|---|
+| `push` | Push a `main` | Todo: unit tests + todos los escenarios |
+| `pull_request` | Cada PR | Todo (evita que entre código roto a `main`) |
+| `schedule` | Cada 6 horas | Solo `@monitor`: **el monitor sintético** |
+| `workflow_dispatch` | Manual (botón *Run workflow*) | Todo, o el tag que indiques en el campo `tags` |
+
+El tag se elige con una sola expresión del workflow:
+```yaml
+TAGS: ${{ github.event_name == 'schedule' && '@monitor' || inputs.tags || '' }}
+```
+Si `TAGS` está vacío se ejecuta todo. Si tiene valor, se pasa como `-Dtags="$TAGS"`.
+
+### Cron: UTC vs. Colombia
+**El cron de GitHub siempre está en UTC.** `0 */6 * * *` significa "minuto 0 de cada 6 horas":
+
+| UTC | Colombia (UTC-5) |
+|---|---|
+| 00:00 | 19:00 (día anterior) |
+| 06:00 | 01:00 |
+| 12:00 | 07:00 |
+| 18:00 | 13:00 |
+
+Colombia no cambia de horario en verano, así que la equivalencia es fija. GitHub puede retrasar las ejecuciones programadas unos minutos cuando hay mucha carga.
+
+### Pasos del job
+1. **Checkout** del código.
+2. **Java 22 (Temurin)** con `cache: gradle`: reutiliza dependencias y la distribución de Gradle entre ejecuciones.
+3. **`./gradlew test acceptanceTest` con `HEADLESS=true`.** El runner `ubuntu-latest` trae Chrome instalado y Selenium Manager descarga el chromedriver correspondiente. `HEADLESS=true` sobrescribe `headless=false` del archivo por la precedencia de `Config`, sin cambiar código.
+4. **Subir `build/reports`** como artifact con `if: always()`: se sube **también cuando las pruebas fallan**, que es justo cuando más se necesita la evidencia (screenshot incluido).
+
+**Permisos:** `contents: read` (solo lectura del repo) e `id-token: write` (permite pedir el token OIDC para AWS, que se usa en la siguiente fase). El workflow no tiene más permisos que esos.
+
+### Dónde ver los reportes
+GitHub → pestaña **Actions** → seleccionar la ejecución → sección **Artifacts** → descargar `sentinel-reports-<run_id>` → abrir `cucumber/index.html`. Los artifacts se guardan 14 días.
