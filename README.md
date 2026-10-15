@@ -85,20 +85,26 @@ src/test/
 │   │   ├── config/Config.java
 │   │   ├── driver/DriverFactory.java    # Crea ChromeDriver (headless o visible)
 │   │   ├── driver/DriverManager.java    # ThreadLocal<WebDriver>: un navegador por hilo
-│   │   └── ui/BasePage.java             # Esperas explícitas y acciones comunes
+│   │   ├── ui/BasePage.java             # Esperas explícitas y acciones comunes
+│   │   └── api/ApiResult.java           # Normaliza respuestas (responseCode del body)
 │   ├── app/                       # Específico del sitio bajo prueba
 │   │   ├── pages/LoginPage.java, HomePage.java
 │   │   ├── pages/components/HeaderComponent.java
+│   │   ├── api/AutomationExerciseApi.java   # Todos los endpoints
+│   │   ├── data/UserData.java (record), UserBuilder.java (Builder + Datafaker)
+│   │   ├── context/ScenarioContext.java     # Estado por escenario (PicoContainer)
 │   │   ├── hooks/Hooks.java
-│   │   └── steps/LoginSteps.java
+│   │   └── steps/ApiSteps.java, LoginSteps.java, CommonSteps.java
 │   ├── runners/RunCucumberTest.java     # Cucumber sobre TestNG, escenarios en paralelo
-│   └── unit/core/ConfigTest.java        # Unit tests del framework (JUnit 5)
+│   └── unit/core/ConfigTest.java, UserBuilderTest.java   # Unit tests (JUnit 5)
 └── resources/
     ├── config.properties, cucumber.properties, testng.xml
-    └── features/ui/login.feature
+    └── features/
+        ├── api/products.feature, api/verify_login.feature
+        └── ui/login.feature
 ```
 
-**`core` vs `app`:** `core` es infraestructura genérica (configuración, navegador, esperas) y no menciona el sitio bajo prueba. Para probar otro sitio se reemplaza `app` y `core` queda igual. `app` contiene todo lo que conoce automationexercise: páginas, locators, steps y hooks.
+**`core` vs `app`:** `core` es infraestructura genérica (configuración, navegador, esperas, normalización de respuestas API) y no menciona el sitio bajo prueba. Para probar otro sitio se reemplaza `app` y `core` queda igual. `app` contiene todo lo que conoce automationexercise: páginas, locators, endpoints, datos, steps y hooks.
 
 Todo vive en `src/test` porque el proyecto es un framework de pruebas, no una aplicación.
 
@@ -156,7 +162,7 @@ Antes de escribir cada locator se revisó el HTML real con `curl`:
 | Mecanismo | Qué guarda | Alcance | Por qué |
 |---|---|---|---|
 | `DriverManager` con `ThreadLocal<WebDriver>` | El navegador | **Por hilo** | El driver es un recurso pesado, ligado al hilo que lo usa. Cada hilo paralelo necesita su propio navegador |
-| PicoContainer (`cucumber-picocontainer`) | Instancias de steps y hooks (y su estado) | **Por escenario** | Cucumber crea un contenedor nuevo por escenario, así que el estado nunca se filtra a otro escenario |
+| PicoContainer (`cucumber-picocontainer`) | `ScenarioContext` (usuario creado, última respuesta API), steps, hooks y el cliente API | **Por escenario** | Cucumber crea un contenedor nuevo por escenario, así que el estado nunca se filtra a otro escenario |
 
 **¿Por qué ambos?** Porque resuelven problemas distintos. Un `ThreadLocal` solo no basta: el hilo se reutiliza entre escenarios y cualquier estado guardado ahí pasaría al siguiente escenario. Pico solo tampoco basta: el `WebDriver` no lo maneja Pico, y Selenium necesita que cada hilo use su propio navegador. Por eso: **hilo → navegador, escenario → estado**.
 
@@ -183,13 +189,36 @@ public static void quit() {
 - El número de hilos está en `src/test/resources/testng.xml`: `data-provider-thread-count="3"`.
 - **Evidencia:** el `@Before` escribe en el reporte `running on thread: TestNG-PoolService-N`.
 
+### Inyección con PicoContainer
+Los steps y hooks reciben sus dependencias por constructor y Pico las crea:
+```java
+public ApiSteps(ScenarioContext context, AutomationExerciseApi api) { ... }
+public LoginSteps(ScenarioContext context) { ... }
+public Hooks(ScenarioContext context, AutomationExerciseApi api) { ... }
+```
+Dentro de un escenario, **las tres clases reciben la misma instancia** de `ScenarioContext`. Así, el usuario que crea `ApiSteps` lo usa `LoginSteps` para iniciar sesión y lo borra `Hooks` al final. En el siguiente escenario Pico crea instancias nuevas. Sin variables `static`, no hay forma de que dos escenarios paralelos compartan estado.
+
 ### Hooks
 | Hook | Qué hace |
 |---|---|
 | `@Before` | Registra en el reporte el nombre del escenario y del hilo |
+| `@After(order = 100)` | Si el escenario creó un usuario, lo borra por API. Si la limpieza falla, **no** marca la prueba como fallida: lo registra en el reporte |
 | `@After(order = 0)` | Si el hilo tiene navegador: adjunta un screenshot si el escenario falló y luego `DriverManager.quit()` (con `remove()`) |
 
-En Cucumber, los `@After` con **orden mayor se ejecutan primero**. La limpieza por API (Fase 3) tendrá `order = 100` para ejecutarse antes de cerrar el navegador.
+En Cucumber, los `@After` con **orden mayor se ejecutan primero**: primero se limpian los datos y después se cierra el navegador.
+
+### Evidencia real (reporte de una ejecución)
+```
+products list            → TestNG-PoolService-1
+verify login (404)       → TestNG-PoolService-2
+verify login (400)       → TestNG-PoolService-3
+invalid UI login         → TestNG-PoolService-3 / Browser closed on thread: TestNG-PoolService-3
+hybrid API + UI          → TestNG-PoolService-2 / Cleanup: deleteAccount ... -> 200 Account deleted!
+                                                / Browser closed on thread: TestNG-PoolService-2
+```
+- Hay 3 hilos distintos: los escenarios corren en paralelo.
+- El hilo 3 ejecutó primero un escenario de API y después uno de UI. Esa **reutilización de hilos** es la razón por la que `remove()` es obligatorio.
+- Solo los escenarios de UI cierran un navegador: los de API nunca lo abrieron (creación lazy).
 
 ### `DriverFactory`
 - Usa solo `ChromeDriver`. **Selenium Manager** descarga el chromedriver que corresponde a la versión de Chrome instalada, así que no hay drivers manuales.
@@ -257,6 +286,87 @@ Son 9 unit tests: lectura del archivo, system property por encima del archivo, u
 
 ---
 
+## Manejo de datos
+
+### `UserData` (record)
+Un `record` inmutable con los 17 campos que exige `POST /api/createAccount`. Los componentes del record usan camelCase de Java (`birthDate`) y `toFormParams()` devuelve un `Map` con los nombres exactos que espera la API (`birth_date`, `mobile_number`…). **Por qué record:** es inmutable (ningún step puede modificar el usuario a mitad del escenario) y `equals`, `hashCode` y `toString` vienen gratis.
+
+### `UserBuilder` (Builder + Datafaker)
+```java
+UserData user = UserBuilder.aUser().build();                        // todo aleatorio y válido
+UserData user = UserBuilder.aUser().withPassword("Secret123").build(); // solo cambia lo que importa
+```
+- **Valores por defecto aleatorios** con Datafaker: nombre, dirección, empresa, etc. Cada prueba indica solo lo que le importa.
+- **Email único:** `sentinel-<12 caracteres de un UUID>@sentinel.test`. Dos hilos en paralelo o dos ejecuciones del cron nunca usan la misma cuenta. El dominio `.test` está reservado y nunca existe, así que no se envían correos a nadie.
+- **Valores que el sitio acepta** (verificados en el formulario real de registro): `country` sale de la lista del select (India, United States, Canada, Australia, Israel, New Zealand, Singapore), `title` es `Mr` o `Mrs` y el mes va de 1 a 12.
+
+### `UserBuilderTest` (JUnit 5)
+Valida que los emails sean únicos entre usuarios, que la sobrescritura cambie solo los campos pedidos, que estén los 17 campos y ninguno vacío, y que el país pertenezca a la lista aceptada.
+
+### Datos de casos negativos: `Examples`
+Los casos inválidos viven en la tabla `Examples` del `Scenario Outline`, dentro del `.feature`. Así son visibles para negocio y agregar un caso es agregar una fila, sin tocar Java.
+
+---
+
+## Capa API
+
+### `AutomationExerciseApi`
+Es el único lugar que usa REST Assured: los steps nunca lo llaman directamente. Tiene un `RequestSpecification` base con `baseUri` desde `Config` y `ContentType.URLENC`, porque la API recibe parámetros de formulario, no JSON.
+
+| Método | Endpoint |
+|---|---|
+| `getProductsList()` | `GET /productsList` |
+| `verifyLogin(email, password)` | `POST /verifyLogin` |
+| `createAccount(UserData)` | `POST /createAccount` |
+| `deleteAccount(email, password)` | `DELETE /deleteAccount` |
+
+### La peculiaridad de esta API (verificada con `curl -i`)
+```
+$ curl -i -X POST .../api/verifyLogin -d "email=nobody@sentinel.test&password=wrong123"
+HTTP/2 200
+content-type: text/html; charset=utf-8
+{"responseCode": 404, "message": "User not found!"}
+```
+1. **El HTTP status casi siempre es 200**, aunque la operación falle. El resultado real está en el campo `responseCode` del body.
+2. **El `Content-Type` es `text/html`** aunque el body sea JSON. REST Assured no lo interpretaría como JSON de forma automática.
+
+**Solución: `ApiResult`** (record en `core/api`). Parsea el body desde `response.asString()`, sin importar el Content-Type, y expone `httpStatus`, `responseCode`, `message` y el `JsonPath` completo. Los steps validan siempre `responseCode` y no necesitan conocer la peculiaridad.
+
+### Parámetro ausente ≠ parámetro vacío
+| Request | Respuesta real |
+|---|---|
+| sin `email` | `400 Bad request, email or password parameter is missing in POST request.` |
+| `email=` (vacío) | `404 User not found!` |
+
+Por eso `verifyLogin` **omite** los parámetros en blanco. En el `.feature`, una celda vacía significa "no enviar el parámetro".
+
+---
+
+## Escenarios y tags
+
+| Escenario | Tipo | Tags | Qué valida |
+|---|---|---|---|
+| The products list returns available products | API | `@api @smoke` | `responseCode` 200 y catálogo no vacío |
+| Invalid login requests are rejected (usuario inexistente) | API | `@api` | 404 `User not found!` |
+| Invalid login requests are rejected (sin email) | API | `@api` | 400 parámetro faltante |
+| Login with invalid credentials shows an error | UI | `@ui @smoke` | Mensaje de error y usuario sin sesión |
+| A user registered through the API can log in through the UI | **Híbrido** | `@ui @smoke @monitor` | Usuario creado por API, login por UI, header muestra `Logged in as <nombre>`, limpieza por API |
+
+**Significado de cada tag:**
+- `@api`: solo API, **nunca abre navegador**.
+- `@ui`: usa navegador.
+- `@smoke`: verificación rápida de lo esencial.
+- `@monitor`: lo que ejecuta el job programado cada 6 horas.
+
+El híbrido **no** lleva `@api`, aunque prepare datos por API. Así `-Dtags="@api"` garantiza que no se abre Chrome.
+
+### ¿Por qué el escenario híbrido?
+- **Preparar datos por API** tarda menos de un segundo y es estable. Registrar un usuario por UI son 3 pantallas y unos 15 campos, cada uno con riesgo de fallar por anuncios o por tiempos de carga.
+- **Validar por UI** lo que de verdad ve el usuario: que puede iniciar sesión.
+- **Limpiar por API** en el `@After`: no quedan cuentas basura en el sitio, aunque el escenario falle.
+
+---
+
 ## Cómo ejecutar localmente (macOS)
 
 **Requisitos:** Java 22, Google Chrome y Git. Gradle **no** hace falta: lo trae el wrapper.
@@ -267,7 +377,9 @@ java -version                              # debe mostrar 22
 ./gradlew test                             # unit tests del framework (JUnit 5)
 ./gradlew acceptanceTest                   # escenarios BDD con Chrome visible
 HEADLESS=true ./gradlew acceptanceTest     # sin ventana, como en CI
-./gradlew acceptanceTest -Dtags="@smoke"   # filtrar por tag
+./gradlew acceptanceTest -Dtags="@api"     # solo API (no abre navegador)
+./gradlew acceptanceTest -Dtags="@monitor" # lo que ejecuta el job programado
+HEADLESS=true ./gradlew test acceptanceTest   # todo, como en CI
 ```
 
 Reporte: abrir `build/reports/cucumber/index.html` en el navegador.
