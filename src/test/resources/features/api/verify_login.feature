@@ -2,6 +2,7 @@
 Feature: Login verification API
 
   # An empty cell means the parameter is not sent at all (the API treats "missing" and "empty" differently).
+  @TC02
   Scenario Outline: Invalid login requests are rejected
     When I verify login with email "<email>" and password "<password>"
     Then the API response code should be <code>

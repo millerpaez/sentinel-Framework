@@ -1,6 +1,7 @@
 @api @smoke
 Feature: Products catalog API
 
+  @TC01
   Scenario: The products list returns available products
     When I request the products list
     Then the API response code should be 200

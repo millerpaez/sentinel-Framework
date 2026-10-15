@@ -250,7 +250,7 @@ flowchart TD
 ```
 
 ### Detalle de Gradle 9 + TestNG
-`RunCucumberTest` no declara ningún `@Test` propio: lo hereda de `AbstractTestNGCucumberTests`, que está dentro del jar de Cucumber. El escáner de clases de Gradle no lo detecta y Gradle 9 falla con *"did not discover any tests"*. Por eso `acceptanceTest` usa `scanForTestClasses = false` e `include '**/runners/**'`. La clase que se ejecuta ya la define `testng.xml`.
+El `@Test` original de `RunCucumberTest` se hereda de `AbstractTestNGCucumberTests`, que está dentro del jar de Cucumber. El escáner de clases de Gradle no lo detectaba y Gradle 9 fallaba con *"did not discover any tests"*. Por eso `acceptanceTest` usa `scanForTestClasses = false` e `include '**/runners/**'`. La clase que se ejecuta ya la define `testng.xml`. (Hoy el runner además redeclara `runScenario` con `@Test` para que el IDE lo detecte; ver "Ejecutar un escenario o una suite específica".)
 
 ---
 
@@ -348,13 +348,15 @@ Por eso `verifyLogin` **omite** los parámetros en blanco. En el `.feature`, una
 
 | Escenario | Tipo | Tags | Qué valida |
 |---|---|---|---|
-| The products list returns available products | API | `@api @smoke` | `responseCode` 200 y catálogo no vacío |
-| Invalid login requests are rejected (usuario inexistente) | API | `@api` | 404 `User not found!` |
-| Invalid login requests are rejected (sin email) | API | `@api` | 400 parámetro faltante |
-| Login with invalid credentials shows an error | UI | `@ui @smoke` | Mensaje de error y usuario sin sesión |
-| A user registered through the API can log in through the UI | **Híbrido** | `@ui @smoke @monitor` | Usuario creado por API, login por UI, header muestra `Logged in as <nombre>`, limpieza por API |
+| `@TC01` The products list returns available products | API | `@api @smoke` | `responseCode` 200 y catálogo no vacío |
+| `@TC02` Invalid login requests are rejected (usuario inexistente) | API | `@api` | 404 `User not found!` |
+| `@TC02` Invalid login requests are rejected (sin email) | API | `@api` | 400 parámetro faltante |
+| `@TC03` Login with invalid credentials shows an error | UI | `@ui @smoke` | Mensaje de error y usuario sin sesión |
+| `@TC04` A user registered through the API can log in through the UI | **Híbrido** | `@ui @smoke @monitor` | Usuario creado por API, login por UI, header muestra `Logged in as <nombre>`, limpieza por API |
 
 **Significado de cada tag:**
+- `@TCxx`: ID único del escenario, para ejecutarlo solo (`-Dtags="@TC03"` o en el runner). Las dos filas del `Scenario Outline` comparten `@TC02`.
+- `@ignore`: Gradle y CI lo saltan (filtro por defecto `not @ignore`).
 - `@api`: solo API, **nunca abre navegador**.
 - `@ui`: usa navegador.
 - `@smoke`: verificación rápida de lo esencial.
@@ -382,9 +384,39 @@ HEADLESS=true ./gradlew acceptanceTest     # sin ventana, como en CI
 ./gradlew acceptanceTest -Dtags="@api"     # solo API (no abre navegador)
 ./gradlew acceptanceTest -Dtags="@monitor" # lo que ejecuta el job programado
 HEADLESS=true ./gradlew test acceptanceTest   # todo, como en CI
+./gradlew acceptanceTest -Dtags="@TC03"   # un solo escenario por su ID
 ```
 
 Reporte: abrir `build/reports/cucumber/index.html` en el navegador.
+
+### Ejecutar un escenario o una suite específica (IDs `@TCxx`)
+Cada escenario tiene un **tag de ID único**: `@TC01` … `@TC04` (ver la tabla en "Escenarios y tags"). Para ejecutar solo uno, o una suite como `@smoke`:
+
+**Desde el IDE (VS Code):** cambia el `tags` del runner y pulsa ▶ junto a la clase o al método `runScenario`:
+```java
+@CucumberOptions(
+        ...
+        tags = "@TC03",          // un escenario
+     // tags = "@TC01 or @TC03", // varios
+     // tags = "@smoke",         // una suite
+     // tags = "",               // todos (valor por defecto)
+```
+Cuando termines, vuelve a dejar `tags = ""`.
+
+**Desde la terminal:** no hace falta tocar el runner:
+```bash
+./gradlew acceptanceTest -Dtags="@TC03"
+```
+
+**¿Y si se me olvida quitar el tag del runner y lo subo?** No pasa nada. Gradle **siempre** envía `cucumber.filter.tags` a la JVM de pruebas, y esa propiedad tiene prioridad sobre el `tags` del runner:
+- con `-Dtags="..."` → ese valor;
+- sin `-Dtags` → `not @ignore`, es decir, todos los escenarios excepto los marcados con `@ignore`.
+
+Así `./gradlew acceptanceTest` y CI ejecutan siempre todo, sin importar lo que diga el runner. El tag del runner solo tiene efecto cuando ejecutas desde el IDE, que no pasa por Gradle. Detalle probado: un valor **vacío** no sirve como "todos", porque Cucumber lo ignora y vuelve al tag del runner. Por eso el valor por defecto es `not @ignore`.
+
+**Bonus `@ignore`:** si un escenario está roto por una causa externa, márcalo con `@ignore` y Gradle y CI lo saltan hasta que se arregle.
+
+**¿Por qué el ▶ del IDE no aparecía antes?** La extensión de tests de Java de VS Code busca `@Test` en el **código fuente**. `RunCucumberTest` heredaba su `@Test` de `AbstractTestNGCucumberTests`, que está dentro del jar de Cucumber, así que el IDE no lo veía. Por eso el runner redeclara `runScenario` con `@Test` y solo llama a `super`: el comportamiento es idéntico, pero ahora el IDE lo detecta. (Si el ▶ no aparece de inmediato: `Cmd+Shift+P` → *Java: Clean Java Language Server Workspace*.)
 
 ---
 

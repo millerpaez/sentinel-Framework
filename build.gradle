@@ -70,11 +70,11 @@ tasks.register('acceptanceTest', Test) {
     scanForTestClasses = false
     include '**/runners/**'
 
-    // -Dtags="@api" en la línea de comandos → filtro de Cucumber en la JVM de pruebas
-    def tags = providers.systemProperty('tags').orNull
-    if (tags) {
-        systemProperty 'cucumber.filter.tags', tags
-    }
+    // -Dtags="@api" en la línea de comandos → filtro de Cucumber en la JVM de pruebas.
+    // Siempre se envía, así el tag que se deje en RunCucumberTest para el IDE nunca filtra Gradle ni CI.
+    // Por defecto 'not @ignore' = todos los escenarios, excepto los marcados @ignore.
+    // (Un valor vacío no sirve: Cucumber lo ignora y vuelve al tag del runner.)
+    systemProperty 'cucumber.filter.tags', providers.systemProperty('tags').getOrElse('not @ignore')
 
     outputs.upToDateWhen { false }
 
