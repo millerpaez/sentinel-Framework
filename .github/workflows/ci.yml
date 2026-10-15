@@ -75,5 +75,9 @@ jobs:
             echo "No Cucumber report generated; nothing to publish."
             exit 0
           fi
-          aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/runs/${{ github.run_id }}/"
-          echo "Report published to s3://${REPORT_BUCKET}/runs/${{ github.run_id }}/" >> "$GITHUB_STEP_SUMMARY"
+          # Readable folder name: UTC date_time + what triggered it + the GitHub run id.
+          # The run id still lets you open the exact run at /actions/runs/<run_id>.
+          STAMP=$(date -u +'%Y-%m-%d_%H%M')
+          PREFIX="runs/${STAMP}_${{ github.event_name }}_${{ github.run_id }}"
+          aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/${PREFIX}/"
+          echo "Report published to s3://${REPORT_BUCKET}/${PREFIX}/" >> "$GITHUB_STEP_SUMMARY"

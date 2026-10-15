@@ -4,7 +4,53 @@
 
 **Monitor sintético BDD en Java:** ejecuta los flujos críticos de [automationexercise.com](https://automationexercise.com) (UI y API) una vez al día, publica los reportes en AWS S3 y deja evidencia de cada fallo.
 
-> 🚧 En construcción por fases. Cada sección se completa cuando termina la fase que la implementa.
+## Contenido
+
+1. [Qué problema resuelve](#qué-problema-resuelve-y-por-qué-un-monitor-sintético)
+2. [Stack y versiones](#stack-y-versiones)
+3. [Gradle en 2 minutos](#gradle-en-2-minutos)
+4. [Arquitectura](#arquitectura)
+5. [Page Object Model](#page-object-model-pom)
+6. [Modelo de hilos](#modelo-de-hilos)
+7. [Flujo de ejecución completo](#flujo-de-ejecución-completo)
+8. [Configuración](#configuración-config)
+9. [Manejo de datos](#manejo-de-datos)
+10. [Capa API](#capa-api)
+11. [Escenarios y tags](#escenarios-y-tags)
+12. [Cómo ejecutar localmente](#cómo-ejecutar-localmente-macos)
+13. [CI (GitHub Actions)](#ci-github-actions)
+14. [AWS: reportes en S3 con OIDC](#aws-reportes-en-s3-con-oidc)
+15. [Decisiones de diseño y trade-offs](#decisiones-de-diseño-y-trade-offs)
+16. [Preguntas de defensa](#preguntas-de-defensa)
+17. [Roadmap v2](#roadmap-v2)
+
+---
+
+## Qué problema resuelve y por qué un monitor sintético
+
+### El problema
+Una aplicación web puede estar "arriba" (el servidor responde 200) y aun así estar **rota para el usuario**: el login no funciona, la API devuelve errores dentro de un HTTP 200, o un cambio en el frontend rompe un formulario. Un chequeo de disponibilidad (*ping*) no detecta nada de esto. Normalmente quien lo descubre es un usuario real, cuando ya es tarde.
+
+### La solución: un monitor sintético
+Un **monitor sintético** es un conjunto de pruebas automatizadas que **simula a un usuario real** recorriendo los flujos críticos, **de forma programada** y contra el ambiente real, sin esperar a que alguien haga un cambio en el código.
+
+| | Pruebas de regresión normales | Monitor sintético (Sentinel) |
+|---|---|---|
+| ¿Cuándo corren? | Cuando cambia el código (push/PR) | **Programado** (una vez al día) + push/PR + manual |
+| ¿Qué detectan? | Errores introducidos por **nuestro** código | También errores **externos**: caídas, cambios del proveedor, datos, infraestructura |
+| ¿Qué dejan? | Un check verde o rojo | **Historial** de reportes en S3 y evidencia (screenshot) de cada fallo |
+
+### Qué hace Sentinel concretamente
+1. **Una vez al día** (y en cada push), GitHub Actions ejecuta los escenarios.
+2. Cada ejecución valida **API y UI**: el catálogo responde, el login rechaza credenciales inválidas, y un usuario nuevo puede registrarse e iniciar sesión.
+3. El job programado ejecuta solo `@monitor`: el **flujo de negocio más crítico** (registro + login), de punta a punta.
+4. El reporte queda en GitHub (14 días) y en **S3** (historial permanente), con screenshot si algo falló.
+5. Un fallo pone el badge en rojo y GitHub envía un correo.
+
+### Por qué BDD (Gherkin)
+Los escenarios están escritos en lenguaje de negocio (`Given / When / Then`). Cualquier persona del equipo, técnica o no, puede leer **qué** se está vigilando, y el reporte habla el mismo idioma.
+
+---
 
 ---
 
@@ -81,6 +127,13 @@ La primera ejecución descarga Gradle en `~/.gradle/wrapper/dists`; las siguient
 ## Arquitectura
 
 ```
+sentinel-Framework/
+├── build.gradle, settings.gradle, gradlew   # Build (ver "Gradle en 2 minutos")
+├── .github/workflows/ci.yml                 # CI y monitor programado
+├── infra/iam/                               # Políticas IAM (trust OIDC + permisos S3)
+└── src/test/
+    └── (detalle abajo)
+
 src/test/
 ├── java/com/miller/sentinel/
 │   ├── core/                      # Reutilizable: NO conoce automationexercise
@@ -240,7 +293,7 @@ flowchart TD
     E --> F["Pool de TestNG (3 hilos)"]
     F --> G["Por cada escenario, en su hilo"]
     G --> G1["1. Cucumber crea un PicoContainer nuevo"]
-    G1 --> G2["2. Pico instancia Hooks y Steps"]
+    G1 --> G2["2. Pico instancia ScenarioContext,<br/>Hooks, Steps y el cliente API"]
     G2 --> G3["3. @Before → log del hilo"]
     G3 --> G4["4. Steps → API (REST Assured) y/o UI<br/>DriverManager.getDriver() crea el driver del hilo"]
     G4 --> G5["5. @After order=100 → borra el usuario por API"]
@@ -489,7 +542,7 @@ jobs:
 | 3 | `Run unit tests and BDD scenarios` | `./gradlew test acceptanceTest` | `HEADLESS=true` como variable de entorno: gracias a la precedencia de `Config`, sobrescribe `headless=false` del archivo sin tocar código. Chrome ya viene en el runner y Selenium Manager descarga el chromedriver correspondiente |
 | 4 | `actions/upload-artifact@v7` | Sube `build/reports` como artifact (14 días) | `if: always()`: se sube **también si las pruebas fallaron**, que es cuando más se necesita la evidencia (screenshot incluido) |
 | 5 | `aws-actions/configure-aws-credentials@v6` | Cambia el token OIDC por credenciales temporales de AWS | Ver sección AWS |
-| 6 | `Publish Cucumber report to S3` | `aws s3 sync` del reporte a `s3://<bucket>/runs/<run_id>/` | Si no se generó reporte (por ejemplo, falló la compilación), termina sin error |
+| 6 | `Publish Cucumber report to S3` | `aws s3 sync` del reporte a `s3://<bucket>/runs/<fecha>_<evento>_<run_id>/` | Solo corre si el paso 5 obtuvo credenciales (`steps.aws.outcome == 'success'`). Si no se generó reporte (por ejemplo, falló la compilación), termina sin error |
 
 **5. Cómo se eligen los tags**
 ```yaml
@@ -524,7 +577,7 @@ flowchart TD
     S3 --> S4["upload-artifact (siempre)"]
     S4 --> P{"¿Es pull_request?"}
     P -->|sí| END["Fin (no toca AWS)"]
-    P -->|no| S5["OIDC → credenciales temporales AWS"] --> S6["aws s3 sync → runs/&lt;run_id&gt;/"] --> END
+    P -->|no| S5["OIDC → credenciales temporales AWS"] --> S6["aws s3 sync →<br/>runs/&lt;fecha&gt;_&lt;evento&gt;_&lt;run_id&gt;/"] --> END
 ```
 
 ### El cron, en detalle
@@ -596,9 +649,16 @@ gh run download <run_id>                    # descarga el artifact
 
 Cada ejecución en `main` sube su reporte Cucumber a:
 ```
-s3://sentinel-reports-millerpaez/runs/<run_id>/index.html
-s3://sentinel-reports-millerpaez/runs/<run_id>/cucumber.json
+s3://sentinel-reports-millerpaez/runs/<fecha>_<evento>_<run_id>/index.html
+s3://sentinel-reports-millerpaez/runs/<fecha>_<evento>_<run_id>/cucumber.json
 ```
+Por ejemplo: `runs/2026-10-15_0100_schedule_38673110711/`.
+
+| Parte | Ejemplo | Para qué |
+|---|---|---|
+| `<fecha>` | `2026-10-15_0100` | Fecha y hora **UTC** (`AAAA-MM-DD_HHMM`). Como empieza por el año, las carpetas quedan **ordenadas cronológicamente** en la consola de S3 |
+| `<evento>` | `schedule`, `push`, `workflow_dispatch` | Qué la disparó: distingue a simple vista las ejecuciones del monitor diario de las de un push o una ejecución manual |
+| `<run_id>` | `38673110711` | ID único de GitHub: garantiza que dos ejecuciones nunca usen la misma carpeta y permite abrir la ejecución exacta en `https://github.com/millerpaez/sentinel-Framework/actions/runs/<run_id>` |
 Así queda un **historial** de todas las ejecuciones del monitor fuera de GitHub, que no expira a los 14 días como los artifacts.
 
 ### Vocabulario de AWS
@@ -777,10 +837,10 @@ El `sub` real es ese `sub_claim_prefix` seguido de `:ref:refs/heads/main` (o `:p
 **Paso 7: probar**
 1. GitHub → **Actions** → **CI** → **Run workflow** (rama `main`).
 2. Cuando termine, revisa que los steps **Configure AWS credentials (OIDC)** y **Publish Cucumber report to S3** estén en verde.
-3. En el **Summary** de la ejecución aparece `Report published to s3://sentinel-reports-millerpaez/runs/<run_id>/`.
+3. En el **Summary** de la ejecución aparece `Report published to s3://sentinel-reports-millerpaez/runs/<fecha>_<evento>_<run_id>/`.
 
 ### Cómo ver los reportes en S3
-1. Consola → **S3** → `sentinel-reports-millerpaez` → carpeta `runs/` → carpeta con el `run_id` (el mismo número que aparece en la URL de la ejecución en GitHub).
+1. Consola → **S3** → `sentinel-reports-millerpaez` → carpeta `runs/` → la carpeta de la fecha que buscas (están ordenadas cronológicamente; las del monitor diario terminan en `_schedule_<run_id>`).
 2. Selecciona `index.html` → **Download** → ábrelo en el navegador. El reporte de Cucumber es un solo archivo HTML autocontenido, así que funciona sin conexión.
 
 El bucket es **privado**: no hay URL pública. Es intencional (sección 14, roadmap: "sitio estático público en S3").
@@ -801,12 +861,16 @@ El bucket es **privado**: no hay URL pública. Es intencional (sección 14, road
     REPORT_BUCKET: ${{ secrets.REPORT_BUCKET }}
   run: |
     if [ ! -d build/reports/cucumber ]; then exit 0; fi   # no hay reporte → nada que subir
-    aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/runs/${{ github.run_id }}/"
+    STAMP=$(date -u +'%Y-%m-%d_%H%M')                     # ej. 2026-10-15_0100 (UTC)
+    PREFIX="runs/${STAMP}_${{ github.event_name }}_${{ github.run_id }}"
+    aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/${PREFIX}/"
 ```
 - `if: always()`: el reporte se publica **aunque las pruebas fallen**. Un monitor que solo guarda evidencia de los éxitos no sirve.
 - `steps.aws.outcome == 'success'`: el paso de S3 depende del paso con `id: aws`. Si no hubo credenciales no tiene sentido intentar subir, y así el log muestra un solo error claro en lugar de dos.
 - No hay ninguna llave en el YAML: `role-to-assume` es solo el **nombre** del rol. La "prueba de identidad" es el token OIDC, que la action pide sola.
-- `aws s3 sync` sube solo lo que no existe o cambió. Como cada ejecución usa una carpeta nueva (`runs/<run_id>/`), en la práctica sube todo y nunca sobrescribe ejecuciones anteriores.
+- `date -u` usa UTC, igual que el cron, para que la hora de la carpeta coincida con la del `schedule`. Es la hora en que se **publica** el reporte (al final del job), no la del inicio.
+- `aws s3 sync` sube solo lo que no existe o cambió. Como cada ejecución usa una carpeta nueva (el `run_id` es único), en la práctica sube todo y nunca sobrescribe ejecuciones anteriores.
+- La política IAM no cambia: la carpeta sigue estando dentro de `runs/`, que es lo único que permite `PutObject`.
 - La AWS CLI ya viene instalada en `ubuntu-latest`.
 
 ### Costos
@@ -836,3 +900,103 @@ Cada reporte pesa unos cientos de KB. Con una ejecución programada al día más
    ```
 
 **Por qué es solo un plan B:** son llaves **permanentes**. Si se filtran, sirven hasta que alguien las revoque, y hay que rotarlas a mano. Con OIDC no existe nada que se pueda filtrar.
+
+---
+
+## Decisiones de diseño y trade-offs
+
+| Decisión | Por qué | Trade-off (lo que se sacrifica) |
+|---|---|---|
+| **TestNG como runner, JUnit 5 para unit tests** | TestNG paraleliza escenarios con `@DataProvider(parallel = true)` y un solo número en `testng.xml`. JUnit 5 es el estándar para probar clases Java pequeñas. Cada motor en su propia tarea de Gradle (`acceptanceTest` / `test`), sin mezclarse | Dos frameworks de pruebas en el classpath y dos formas de configurarlos |
+| **`ThreadLocal` para el driver + PicoContainer para el estado** | Cada mecanismo resuelve un alcance distinto: hilo (navegador) y escenario (datos) | Hay que entender los dos y llamar siempre a `remove()` |
+| **Escenario híbrido (datos por API, validación por UI)** | Rápido y estable: la UI se usa solo para lo que se quiere validar | No valida el formulario de registro por UI (no es el objetivo del monitor) |
+| **Navegación directa por URL** (`/login`) | Los anuncios del sitio interceptan clics en el menú | No prueba la navegación por menú |
+| **`PageLoadStrategy.EAGER`** | No espera a que carguen anuncios y trackers: ejecución más rápida y estable | Hay que confiar en las esperas explícitas (que de todas formas son obligatorias) |
+| **Sin `Thread.sleep` ni waits implícitos** | Las esperas explícitas esperan **solo lo necesario** y fallan con un mensaje claro | `isVisible` espera hasta el timeout cuando el elemento no aparece (≈10 s en el caso negativo) |
+| **`ApiResult` normaliza las respuestas** | La API devuelve HTTP 200 con el código real en el body y `Content-Type: text/html` | Una capa más; si la API se arreglara, solo cambia `ApiResult` |
+| **Locators `data-qa`** | Atributos pensados para automatización: no cambian con el diseño | Dependen de que el sitio los mantenga |
+| **Email único con UUID** | Escenarios paralelos y ejecuciones del cron nunca chocan | Las cuentas son desechables (se borran en el `@After`) |
+| **Java 22** | Es la versión instalada en la máquina de desarrollo y se usa la misma en CI | **No es LTS** y ya no recibe parches. Lo recomendable es migrar a Java 25 (LTS): basta con cambiar `languageVersion` en `build.gradle` y `java-version` en `ci.yml` |
+| **Versiones mayores fijas** (Cucumber 7, JUnit 5, REST Assured 5) | Estables y compatibles entre sí; cambiar de versión mayor trae cambios incompatibles | No se usan las últimas versiones mayores |
+| **Cron una vez al día** | Suficiente para un sitio de demostración y genera menos ruido | Un fallo puede tardar hasta 24 h en detectarse (en producción real se usaría un intervalo más corto) |
+| **OIDC en lugar de llaves IAM** | No existe ninguna llave que se pueda filtrar; las credenciales expiran solas | Configuración inicial más compleja (proveedor, rol, trust policy) |
+| **`sub` inmutable en la trust policy** | Los IDs numéricos nunca se reutilizan, así que un repo "impostor" con el mismo nombre no puede asumir el rol | El `sub` es menos legible |
+| **AWS solo desde `main`, nunca en PRs** | Un PR puede venir de un fork con código malicioso | Los PRs no publican reporte en S3 (sí como artifact) |
+| **Permisos S3 mínimos** (`ListBucket` + `PutObject` en `runs/*`) | Credenciales robadas no podrían borrar ni leer el historial | Para leer o limpiar el bucket hay que usar otra identidad (la consola) |
+| **Gradle siempre envía `cucumber.filter.tags`** (por defecto `not @ignore`) | Un tag olvidado en el runner del IDE nunca filtra CI | El valor del runner solo aplica al ejecutar desde el IDE |
+| **Monorepo en `src/test`, un solo módulo** | Simple para el alcance actual | `core` y `app` no se pueden publicar por separado (ver roadmap: multi-módulo) |
+
+---
+
+## Preguntas de defensa
+
+**1. ¿Por qué ThreadLocal y PicoContainer al mismo tiempo?**
+Porque resuelven alcances distintos. `ThreadLocal` guarda el **navegador por hilo**: Selenium necesita que cada hilo paralelo tenga su propio driver. PicoContainer guarda el **estado por escenario**: Cucumber crea un contenedor nuevo para cada escenario. Como TestNG reutiliza hilos, un `ThreadLocal` solo pasaría estado de un escenario al siguiente. Y Pico solo no sirve para el driver, porque el driver está ligado al hilo, no al escenario.
+
+**2. ¿Qué pasa si no se llama a `ThreadLocal.remove()`?**
+TestNG reutiliza los hilos de su pool. El siguiente escenario en ese hilo encontraría el driver ya cerrado: `getDriver()` no crearía uno nuevo porque el valor no es `null`, y fallaría con `NoSuchSessionException`. Además, el objeto nunca se libera (fuga de memoria). Por eso `remove()` está en un `finally`. En el reporte real se ve el hilo 3 ejecutar un escenario de API y después uno de UI: la reutilización es real.
+
+**3. ¿Por qué TestNG como runner y JUnit 5 para unit tests?**
+TestNG paraleliza escenarios de Cucumber de forma nativa (`@DataProvider(parallel = true)` + `data-provider-thread-count` en `testng.xml`). JUnit 5 es el estándar para unit tests de clases Java (`Config`, `UserBuilder`). Cada uno tiene su propia tarea de Gradle y nunca se mezclan: así un unit test roto se distingue de un problema del sitio.
+
+**4. ¿Por qué preparar datos por API y no por UI?**
+Velocidad y estabilidad. Crear un usuario por API tarda menos de un segundo. Por UI son 3 pantallas y unos 15 campos, cada uno expuesto a anuncios y tiempos de carga. La UI se reserva para lo que se quiere validar: que el usuario puede iniciar sesión y ve su nombre. La limpieza también es por API, en el `@After`, y corre aunque el escenario falle.
+
+**5. ¿Cómo evitas que escenarios paralelos choquen con los mismos datos?**
+- Cada usuario tiene un **email único** (`sentinel-<UUID>@sentinel.test`).
+- El estado vive en `ScenarioContext`, **una instancia por escenario** (Pico), sin variables `static`.
+- Cada hilo tiene **su propio navegador** (`ThreadLocal`).
+- Cada escenario **borra lo que creó** en el `@After`.
+
+**6. ¿Por qué no hay `Thread.sleep`?**
+Un `sleep` espera siempre el tiempo completo: si es corto, la prueba falla de forma intermitente (*flaky*), y si es largo, la suite se vuelve lenta. Las **esperas explícitas** (`WebDriverWait` en `BasePage`) esperan **solo hasta que se cumple la condición**, con un timeout configurable y un error claro. Tampoco hay waits implícitos: mezclarlos con explícitos produce tiempos de espera impredecibles.
+
+**7. ¿Qué es OIDC y por qué es mejor que llaves IAM?**
+Con OIDC, AWS confía en los tokens que firma GitHub. En cada ejecución, el workflow presenta un token que dice "soy el repo X en la rama `main`". AWS lo verifica contra la trust policy y entrega **credenciales temporales** (≈1 hora). No hay ninguna llave guardada que se pueda filtrar. Con llaves IAM, en cambio, la llave es permanente: si se filtra, sirve hasta que alguien la revoque. Además, en Sentinel el rol solo acepta la rama `main` de este repo (identificado por IDs inmutables) y solo puede escribir en `runs/*`.
+
+**8. ¿Qué cambiarías para escalar esto?**
+- **Selenium Grid en Docker:** más hilos sin saturar la máquina, y navegadores en contenedores.
+- **Matriz de navegadores** (Firefox, Edge): `DriverFactory` ya centraliza la creación.
+- **Allure:** reportes con historial y tendencias.
+- **DynamoDB:** guardar el resultado de cada ejecución para ver tendencias.
+- **SNS:** alertas por correo o Slack cuando el monitor falla.
+- **Gradle multi-módulo:** publicar `core` como librería reutilizable.
+- **Java 25 LTS.**
+
+**9. ¿Por qué no hay aserciones en los Page Objects?**
+El page sabe **cómo** interactuar con la pantalla y el step sabe **qué** se espera. `getErrorMessage()` sirve tanto para esperar un error como para verificar que no lo haya. Y la aserción en el step hace que el reporte de Cucumber muestre el fallo en el paso de negocio correcto.
+
+**10. ¿Por qué validas `responseCode` y no el HTTP status?**
+Porque esta API responde **HTTP 200 incluso cuando falla**, y el código real viene en el body. Además el `Content-Type` es `text/html` aunque el body sea JSON. `ApiResult` parsea el body desde el texto y expone `responseCode`, así que los steps no necesitan conocer esa peculiaridad.
+
+**11. ¿Qué pasa si la limpieza del `@After` falla?**
+Se registra en el reporte, pero **no** marca la prueba como fallida. Un problema al limpiar no debe convertir en rojo un escenario cuyo objetivo se cumplió. El email es único, así que una cuenta huérfana no afecta a otras ejecuciones.
+
+**12. ¿Cómo demuestras que los escenarios corren en paralelo?**
+El `@Before` registra en el reporte el nombre del hilo. Una ejecución real muestra `TestNG-PoolService-1`, `-2` y `-3`. El número de hilos se configura en un solo lugar: `data-provider-thread-count="3"` en `testng.xml`.
+
+**13. ¿Cómo ejecutas un solo escenario?**
+Cada escenario tiene un ID (`@TC01`…`@TC04`). Desde la terminal: `./gradlew acceptanceTest -Dtags="@TC03"`. Desde el IDE: se pone el tag en `tags` del runner y se pulsa ▶. Gradle siempre sobrescribe ese valor (por defecto con `not @ignore`), así que un tag olvidado en el runner nunca afecta a CI.
+
+**14. ¿Qué fue lo más difícil o qué aprendiste?**
+Tres cosas que solo aparecieron al ejecutar contra sistemas reales:
+- **Gradle 9** no detecta el `@Test` heredado del runner de Cucumber. Se resolvió con `scanForTestClasses = false`, y el runner redeclara `runScenario` para que el IDE también lo vea.
+- **La API** distingue "parámetro ausente" (400) de "parámetro vacío" (404).
+- **OIDC:** el repo usa el `sub` **inmutable** de GitHub (con IDs numéricos), no el clásico. La primera ejecución falló con `Not authorized` hasta ajustar la trust policy.
+
+---
+
+## Roadmap v2
+
+Fuera del alcance de la v1, por orden de valor:
+
+| Mejora | Valor |
+|---|---|
+| **Alertas con SNS** (correo o Slack cuando falla `@monitor`) | Un monitor solo sirve si alguien se entera a tiempo |
+| **DynamoDB para el historial de ejecuciones** | Tendencias: tasa de éxito, duración, fallos intermitentes |
+| **Allure** | Reportes más ricos, con historial y categorías de fallos |
+| **Selenium Grid en Docker** | Más paralelismo sin depender de la máquina local |
+| **Firefox / matriz de navegadores** | Cobertura multi-navegador (`DriverFactory` ya está preparado) |
+| **Sitio estático público en S3** | Ver los reportes desde una URL sin descargar archivos |
+| **Gradle multi-módulo** | Publicar `core` como librería reutilizable para otros proyectos |
+
