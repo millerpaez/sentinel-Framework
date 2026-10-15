@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/millerpaez/sentinel-Framework/actions/workflows/ci.yml/badge.svg)](https://github.com/millerpaez/sentinel-Framework/actions/workflows/ci.yml)
 
-**Monitor sintético BDD en Java:** ejecuta los flujos críticos de [automationexercise.com](https://automationexercise.com) (UI y API) cada 6 horas, publica los reportes en AWS S3 y deja evidencia de cada fallo.
+**Monitor sintético BDD en Java:** ejecuta los flujos críticos de [automationexercise.com](https://automationexercise.com) (UI y API) una vez al día, publica los reportes en AWS S3 y deja evidencia de cada fallo.
 
 > 🚧 En construcción por fases. Cada sección se completa cuando termina la fase que la implementa.
 
@@ -358,7 +358,7 @@ Por eso `verifyLogin` **omite** los parámetros en blanco. En el `.feature`, una
 - `@api`: solo API, **nunca abre navegador**.
 - `@ui`: usa navegador.
 - `@smoke`: verificación rápida de lo esencial.
-- `@monitor`: lo que ejecuta el job programado cada 6 horas.
+- `@monitor`: lo que ejecuta el job programado una vez al día.
 
 El híbrido **no** lleva `@api`, aunque prepare datos por API. Así `-Dtags="@api"` garantiza que no se abre Chrome.
 
@@ -390,42 +390,396 @@ Reporte: abrir `build/reports/cucumber/index.html` en el navegador.
 
 ## CI (GitHub Actions)
 
-Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). El badge al inicio del README muestra el estado de la última ejecución en `main`.
+Workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). El badge al inicio del README muestra el estado de la última ejecución en `main`: verde si pasó y rojo si falló.
 
-### Disparadores
+### Conceptos básicos (vocabulario)
 
-| Evento | Cuándo | Qué ejecuta |
+| Concepto | Qué es | En este proyecto |
 |---|---|---|
-| `push` | Push a `main` | Todo: unit tests + todos los escenarios |
-| `pull_request` | Cada PR | Todo (evita que entre código roto a `main`) |
-| `schedule` | Cada 6 horas | Solo `@monitor`: **el monitor sintético** |
-| `workflow_dispatch` | Manual (botón *Run workflow*) | Todo, o el tag que indiques en el campo `tags` |
+| **Workflow** | Un archivo YAML en `.github/workflows/` que describe una automatización | `ci.yml` |
+| **Evento (trigger)** | Lo que hace que el workflow arranque | `push`, `pull_request`, `schedule`, `workflow_dispatch` |
+| **Job** | Un grupo de pasos que corre en **una** máquina | Un solo job: `test` |
+| **Runner** | La máquina virtual que GitHub presta para ejecutar el job. Se crea limpia en cada ejecución y se destruye al terminar | `ubuntu-latest` (trae Chrome, Java y AWS CLI preinstalados) |
+| **Step** | Un paso del job. Puede ser `uses:` (una *action* ya hecha por alguien) o `run:` (comandos de shell) | 6 steps |
+| **Action** | Un paso reutilizable publicado en GitHub, con versión (`@v7`) | `actions/checkout`, `actions/setup-java`, `actions/upload-artifact`, `aws-actions/configure-aws-credentials` |
+| **Expresión** | Código entre `${{ }}` que GitHub evalúa **antes** de ejecutar el paso | `${{ github.run_id }}`, `${{ secrets.AWS_ROLE_ARN }}` |
+| **Contexto** | Objetos de datos disponibles en las expresiones | `github` (evento, run id…), `secrets`, `inputs` |
+| **`if:`** | Condición para ejecutar un step. Por defecto un step **solo corre si todos los anteriores pasaron** | `if: always()` lo ejecuta aunque las pruebas fallen |
+| **Artifact** | Archivos que el job guarda al terminar y que se descargan desde la página de la ejecución | `sentinel-reports-<run_id>` |
+| **Secret** | Valor guardado cifrado en GitHub. No aparece en el código y GitHub lo oculta (`***`) en los logs | `AWS_ROLE_ARN`, `REPORT_BUCKET` |
 
-El tag se elige con una sola expresión del workflow:
+### Recorrido del archivo, bloque por bloque
+
+**1. Cuándo se ejecuta (`on:`)**
+```yaml
+on:
+  push:
+    branches: [main]        # cada push a main
+  pull_request:             # cada PR (hacia cualquier rama)
+  schedule:
+    - cron: "0 1 * * *"     # una vez al día (UTC)
+  workflow_dispatch:        # botón manual "Run workflow"
+    inputs:
+      tags: ...             # campo opcional para elegir tags
+```
+
+| Evento | Cuándo | Qué ejecuta | ¿Publica en S3? |
+|---|---|---|---|
+| `push` | Push a `main` | Todo: unit tests + todos los escenarios | Sí |
+| `pull_request` | Cada PR | Todo (evita que entre código roto a `main`) | **No** (ver sección AWS) |
+| `schedule` | Una vez al día | Solo `@monitor`: **el monitor sintético** | Sí |
+| `workflow_dispatch` | Manual | Todo, o el tag que escribas en `tags` | Sí |
+
+**2. Permisos (`permissions:`)**
+```yaml
+permissions:
+  contents: read      # puede leer el código del repo, nada más
+  id-token: write     # puede pedir a GitHub un token OIDC (para AWS)
+```
+Cada job recibe un token temporal de GitHub (`GITHUB_TOKEN`). Declarar `permissions` limita lo que ese token puede hacer. Aquí puede leer el código y pedir el token OIDC, nada más: no puede escribir en el repo, crear releases ni comentar en PRs. A esto se le llama **mínimo privilegio**.
+
+`id-token: write` **no** da acceso a AWS por sí solo. Solo permite pedir un "documento de identidad" firmado por GitHub. Es AWS quien decide si confía en él (ver sección AWS).
+
+**3. El job**
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20      # si algo se cuelga, GitHub lo mata a los 20 min
+```
+
+**4. Los pasos**
+
+| # | Step | Qué hace | Detalle |
+|---|---|---|---|
+| 1 | `actions/checkout@v7` | Descarga el código del repo en el runner | El runner empieza vacío |
+| 2 | `actions/setup-java@v6` | Instala Java 22 (Temurin) | `cache: gradle` guarda `~/.gradle` entre ejecuciones (Gradle, dependencias): la segunda ejecución es mucho más rápida |
+| 3 | `Run unit tests and BDD scenarios` | `./gradlew test acceptanceTest` | `HEADLESS=true` como variable de entorno: gracias a la precedencia de `Config`, sobrescribe `headless=false` del archivo sin tocar código. Chrome ya viene en el runner y Selenium Manager descarga el chromedriver correspondiente |
+| 4 | `actions/upload-artifact@v7` | Sube `build/reports` como artifact (14 días) | `if: always()`: se sube **también si las pruebas fallaron**, que es cuando más se necesita la evidencia (screenshot incluido) |
+| 5 | `aws-actions/configure-aws-credentials@v6` | Cambia el token OIDC por credenciales temporales de AWS | Ver sección AWS |
+| 6 | `Publish Cucumber report to S3` | `aws s3 sync` del reporte a `s3://<bucket>/runs/<run_id>/` | Si no se generó reporte (por ejemplo, falló la compilación), termina sin error |
+
+**5. Cómo se eligen los tags**
 ```yaml
 TAGS: ${{ github.event_name == 'schedule' && '@monitor' || inputs.tags || '' }}
 ```
-Si `TAGS` está vacío se ejecuta todo. Si tiene valor, se pasa como `-Dtags="$TAGS"`.
+Se lee como un "si / si no" encadenado:
+- Si el evento es `schedule` → `@monitor`.
+- Si no, si alguien escribió tags al lanzarlo manualmente → esos tags.
+- Si no → vacío.
 
-### Cron: UTC vs. Colombia
-**El cron de GitHub siempre está en UTC.** `0 */6 * * *` significa "minuto 0 de cada 6 horas":
+Luego el script de shell decide:
+```bash
+if [ -n "$TAGS" ]; then            # -n = "no está vacío"
+  ./gradlew test acceptanceTest -Dtags="$TAGS"
+else
+  ./gradlew test acceptanceTest    # todo
+fi
+```
 
-| UTC | Colombia (UTC-5) |
+### Flujo del job
+
+```mermaid
+flowchart TD
+    E{"¿Qué evento?"} -->|push / PR| ALL["TAGS vacío → todo"]
+    E -->|schedule| MON["TAGS = @monitor"]
+    E -->|workflow_dispatch| IN["TAGS = lo que escribiste (o todo)"]
+    ALL --> R
+    MON --> R
+    IN --> R
+    R["Runner ubuntu-latest limpio"] --> S1["checkout"] --> S2["Java 22 + cache Gradle"]
+    S2 --> S3["./gradlew test acceptanceTest<br/>HEADLESS=true"]
+    S3 --> S4["upload-artifact (siempre)"]
+    S4 --> P{"¿Es pull_request?"}
+    P -->|sí| END["Fin (no toca AWS)"]
+    P -->|no| S5["OIDC → credenciales temporales AWS"] --> S6["aws s3 sync → runs/&lt;run_id&gt;/"] --> END
+```
+
+### El cron, en detalle
+
+Un cron tiene **5 campos**: `minuto hora día-del-mes mes día-de-la-semana`. Un `*` significa "cualquiera".
+
+```
+0 1 * * *
+│ │ │ │ └── cualquier día de la semana
+│ │ │ └──── cualquier mes
+│ │ └────── cualquier día del mes
+│ └──────── hora 1
+└────────── minuto 0
+```
+→ **Todos los días a las 01:00 UTC.**
+
+**El cron de GitHub siempre está en UTC.** Colombia es UTC-5 todo el año (no cambia de horario), así que:
+
+| UTC | Colombia |
 |---|---|
-| 00:00 | 19:00 (día anterior) |
-| 06:00 | 01:00 |
-| 12:00 | 07:00 |
-| 18:00 | 13:00 |
+| 01:00 | **20:00 del día anterior** |
 
-Colombia no cambia de horario en verano, así que la equivalencia es fija. GitHub puede retrasar las ejecuciones programadas unos minutos cuando hay mucha carga.
+Cosas que conviene saber del `schedule`:
+- **Solo corre en la rama por defecto** (`main`). Un cron en otra rama no hace nada.
+- **Puede retrasarse** de minutos a más de una hora cuando GitHub tiene mucha carga. Es normal y no indica un error.
+- **GitHub desactiva los workflows programados** de un repo público después de **60 días sin actividad** en el repo. Si pasa, se reactiva desde la pestaña Actions.
+- El primer cron se ejecuta en la siguiente 01:00 UTC después de que el archivo llegue a `main`.
 
-### Pasos del job
-1. **Checkout** del código.
-2. **Java 22 (Temurin)** con `cache: gradle`: reutiliza dependencias y la distribución de Gradle entre ejecuciones.
-3. **`./gradlew test acceptanceTest` con `HEADLESS=true`.** El runner `ubuntu-latest` trae Chrome instalado y Selenium Manager descarga el chromedriver correspondiente. `HEADLESS=true` sobrescribe `headless=false` del archivo por la precedencia de `Config`, sin cambiar código.
-4. **Subir `build/reports`** como artifact con `if: always()`: se sube **también cuando las pruebas fallan**, que es justo cuando más se necesita la evidencia (screenshot incluido).
+### Cómo lanzarlo manualmente
 
-**Permisos:** `contents: read` (solo lectura del repo) e `id-token: write` (permite pedir el token OIDC para AWS, que se usa en la siguiente fase). El workflow no tiene más permisos que esos.
+**Desde la web:** GitHub → pestaña **Actions** → workflow **CI** (columna izquierda) → botón **Run workflow** → rama `main` → en `tags`, opcionalmente `@monitor` → **Run workflow**.
 
-### Dónde ver los reportes
-GitHub → pestaña **Actions** → seleccionar la ejecución → sección **Artifacts** → descargar `sentinel-reports-<run_id>` → abrir `cucumber/index.html`. Los artifacts se guardan 14 días.
+**Desde la terminal** (con [GitHub CLI](https://cli.github.com/)):
+```bash
+gh workflow run ci.yml                      # todo
+gh workflow run ci.yml -f tags="@monitor"   # solo el monitor
+gh run watch                                # seguir la ejecución en vivo
+```
+
+### Dónde ver los resultados
+
+| Qué | Dónde |
+|---|---|
+| Estado general | Badge del README, o el ✅/❌ junto a cada commit |
+| Lista de ejecuciones | Pestaña **Actions** → workflow **CI** |
+| Logs de cada paso | Abrir una ejecución → job `test` → expandir el step |
+| Reporte Cucumber (GitHub) | Abrir una ejecución → sección **Artifacts** (abajo) → descargar `sentinel-reports-<run_id>` → descomprimir → abrir `cucumber/index.html` |
+| Reporte Cucumber (S3) | Ver sección AWS → "Cómo ver los reportes en S3" |
+| Ruta exacta en S3 | En el **Summary** de la ejecución aparece `Report published to s3://...` |
+
+Desde la terminal:
+```bash
+gh run list --limit 5                       # últimas ejecuciones
+gh run view <run_id> --log-failed           # solo los logs de lo que falló
+gh run download <run_id>                    # descarga el artifact
+```
+
+### ¿Qué pasa cuando algo falla?
+1. El step de pruebas termina en rojo (Gradle sale con código ≠ 0).
+2. Aun así, `upload-artifact` sube el reporte (`if: always()`), con el **screenshot** del fallo adjunto en el escenario.
+3. Aun así, el reporte se publica en S3.
+4. El job y el badge quedan en rojo, y GitHub envía un correo al dueño del repo (configurable en GitHub → Settings → Notifications).
+
+---
+
+## AWS: reportes en S3 con OIDC
+
+### Qué se construye
+
+Cada ejecución en `main` sube su reporte Cucumber a:
+```
+s3://sentinel-reports-millerpaez/runs/<run_id>/index.html
+s3://sentinel-reports-millerpaez/runs/<run_id>/cucumber.json
+```
+Así queda un **historial** de todas las ejecuciones del monitor fuera de GitHub, que no expira a los 14 días como los artifacts.
+
+### Vocabulario de AWS
+
+| Concepto | Qué es (en simple) |
+|---|---|
+| **S3** | Servicio de almacenamiento de archivos. Un **bucket** es una "carpeta raíz" con nombre único en todo AWS |
+| **Región** | Centro de datos donde vive el recurso. Aquí: `us-east-1` (Virginia) |
+| **IAM** | Servicio de identidades y permisos de AWS: **quién** puede hacer **qué** sobre **cuál** recurso |
+| **Rol IAM** | Una identidad **sin contraseña ni llaves** que alguien de confianza puede "asumir" temporalmente |
+| **Política de confianza** (*trust policy*) | Define **quién puede asumir** el rol |
+| **Política de permisos** | Define **qué puede hacer** quien asumió el rol |
+| **ARN** | El "nombre completo" único de cualquier recurso de AWS, por ejemplo `arn:aws:iam::146183084500:role/sentinel-github-actions` |
+| **Proveedor de identidad OIDC** | Un registro en IAM que le dice a AWS "confío en los tokens firmados por este emisor" (aquí, GitHub) |
+| **STS** | Servicio que entrega **credenciales temporales** a quien asume un rol |
+
+### OIDC explicado
+
+**Problema:** para subir archivos a S3, GitHub Actions necesita credenciales de AWS. La forma antigua es crear llaves permanentes (access key + secret) y guardarlas en GitHub. Si esas llaves se filtran, sirven para siempre hasta que alguien las revoque.
+
+**Solución OIDC (OpenID Connect):** AWS confía en GitHub como "proveedor de identidad". En cada ejecución, GitHub emite un token firmado que dice "soy el workflow del repo `millerpaez/sentinel-Framework`". AWS verifica la firma, revisa que el repo coincida con la condición del rol y entrega **credenciales temporales** (expiran en minutos). No existe ninguna llave guardada.
+
+**Analogía:** es como entrar a un edificio. Las llaves IAM son una copia de la llave de la puerta: si la pierdes, quien la encuentre entra cuando quiera. OIDC es mostrar tu cédula en recepción (el token firmado por GitHub). La recepción (AWS) verifica que la cédula sea auténtica y que estés en la lista (la condición del rol), y te da un **pase de visitante que vence en una hora** (las credenciales temporales).
+
+### Paso a paso de lo que ocurre en cada ejecución
+
+```mermaid
+sequenceDiagram
+    participant J as Job de GitHub Actions
+    participant G as GitHub OIDC<br/>(token.actions.githubusercontent.com)
+    participant STS as AWS STS
+    participant IAM as Rol IAM<br/>sentinel-github-actions
+    participant S3 as Bucket S3
+
+    J->>G: 1. Pide un token (permitido por id-token: write)
+    G-->>J: 2. Token JWT firmado: aud=sts.amazonaws.com,<br/>sub=repo:millerpaez/sentinel-Framework:ref:refs/heads/main
+    J->>STS: 3. AssumeRoleWithWebIdentity(rol, token)
+    STS->>IAM: 4. ¿La trust policy acepta este token?
+    Note over STS,IAM: Verifica la firma de GitHub,<br/>que aud y sub coincidan EXACTO
+    STS-->>J: 5. Credenciales temporales (≈1 hora)
+    J->>S3: 6. aws s3 sync (ListBucket + PutObject en runs/*)
+    S3-->>J: 7. OK (cualquier otra acción → AccessDenied)
+```
+
+1. El step `configure-aws-credentials` pide a GitHub un token OIDC. Solo puede hacerlo porque el workflow tiene `id-token: write`.
+2. GitHub entrega un **JWT** (un JSON firmado digitalmente) con *claims* (datos) sobre quién lo pide. Los dos que importan son:
+   - `aud` (audiencia): `sts.amazonaws.com`, es decir, "este token es para AWS".
+   - `sub` (sujeto): `repo:millerpaez/sentinel-Framework:ref:refs/heads/main`, es decir, "soy este repo, en esta rama".
+3. El step llama a AWS STS, `AssumeRoleWithWebIdentity`, con el ARN del rol y el token.
+4. AWS revisa la **trust policy** del rol: que la firma sea de GitHub y que `aud` y `sub` coincidan exactamente.
+5. Si todo coincide, STS devuelve credenciales temporales. El step las guarda como variables de entorno y los siguientes pasos del job (el `aws s3 sync`) las usan automáticamente.
+6. `aws s3 sync` sube el reporte. Solo puede listar el bucket y escribir dentro de `runs/`: no puede borrar ni leer nada.
+
+### Los dos archivos de `infra/iam/`, línea por línea
+
+**[`infra/iam/trust-policy.json`](infra/iam/trust-policy.json): quién puede asumir el rol**
+```json
+{
+  "Version": "2012-10-17",                                   // versión del lenguaje de políticas (siempre esta)
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {                                           // QUIÉN: tokens del proveedor OIDC de GitHub
+      "Federated": "arn:aws:iam::146183084500:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",               // asumir el rol presentando un token web
+    "Condition": {
+      "StringEquals": {                                      // coincidencia EXACTA (distingue mayúsculas)
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:millerpaez/sentinel-Framework:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+```
+(Los comentarios `//` son solo explicativos: JSON no admite comentarios y el archivo real no los tiene.)
+
+**La condición `sub` es la que da la seguridad.** Sin ella, **cualquier repositorio de GitHub del mundo** podría asumir el rol, porque todos los tokens los firma el mismo emisor. Con ella, solo puede asumirlo:
+- el repo `millerpaez/sentinel-Framework` (no un fork, no otro repo),
+- y solo en la rama `main` (`push` a main, `schedule` y `workflow_dispatch` lanzados desde main).
+
+Un PR genera un `sub` distinto (`repo:millerpaez/sentinel-Framework:pull_request`), así que AWS lo rechazaría. Por eso además los pasos de AWS tienen `if: github.event_name != 'pull_request'`: ni siquiera lo intentan. Esto importa porque un PR puede venir de un desconocido con código malicioso.
+
+**[`infra/iam/s3-report-policy.json`](infra/iam/s3-report-policy.json): qué puede hacer el rol**
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "ListReportBucket",                             // listar el contenido del bucket
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::sentinel-reports-millerpaez" },        // el bucket (sin /*)
+    { "Sid": "UploadReportsUnderRuns",                       // subir archivos...
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::sentinel-reports-millerpaez/runs/*" }  // ...solo dentro de runs/
+  ]
+}
+```
+- `aws s3 sync` necesita **`ListBucket`** para comparar qué hay en el destino y **`PutObject`** para subir.
+- `ListBucket` se aplica al **bucket** (ARN sin `/*`) y `PutObject` a los **objetos** (ARN con `/...`). Es una regla de S3 y un error muy común.
+- `PutObject` está limitado a `runs/*`, aún más restringido que todo el bucket.
+- **No** tiene `DeleteObject` ni `GetObject`: aunque alguien robara las credenciales temporales durante su hora de vida, no podría borrar el historial ni leer nada.
+
+### Configuración en la consola de AWS (paso a paso)
+
+> Haz los pasos en este orden. Inicia sesión en https://console.aws.amazon.com con la cuenta `millerAWS` (ID `146183084500`) y, arriba a la derecha, selecciona la región **N. Virginia (us-east-1)**.
+
+**Paso 1: presupuesto (protección de costos). Hazlo primero.**
+1. Buscador superior → **Billing and Cost Management** → menú izquierdo **Budgets** → **Create budget**.
+2. Elige **Use a template** → **Monthly cost budget**.
+3. Nombre: `sentinel-budget`. Monto: **5.00 USD**. Email: tu correo.
+4. **Create budget**. AWS te enviará un correo si el gasto se acerca a 5 USD.
+
+**Paso 2: bucket S3**
+1. Buscador → **S3** → **Create bucket**.
+2. **Bucket type:** General purpose. **Bucket name:** `sentinel-reports-millerpaez`.
+3. **Region:** `us-east-1`.
+4. **Object Ownership:** ACLs disabled (por defecto).
+5. **Block all public access:** ✅ **activado** (por defecto). Los reportes son privados.
+6. Lo demás por defecto (cifrado SSE-S3 activado) → **Create bucket**.
+
+**Paso 3: proveedor de identidad OIDC (una sola vez por cuenta)**
+1. Buscador → **IAM** → menú izquierdo **Identity providers** → **Add provider**.
+2. **Provider type:** OpenID Connect.
+3. **Provider URL:** `https://token.actions.githubusercontent.com`.
+4. **Audience:** `sts.amazonaws.com`.
+5. **Add provider**. Su ARN queda como `arn:aws:iam::146183084500:oidc-provider/token.actions.githubusercontent.com`, que es exactamente el que aparece en `trust-policy.json`.
+
+**Paso 4: rol IAM**
+1. IAM → **Roles** → **Create role**.
+2. **Trusted entity type:** Web identity.
+3. **Identity provider:** `token.actions.githubusercontent.com`. **Audience:** `sts.amazonaws.com`.
+4. Llena los campos de GitHub:
+   - **GitHub organization:** `millerpaez`
+   - **GitHub repository:** `sentinel-Framework` (con la **F mayúscula**, exactamente igual)
+   - **GitHub branch:** `main`
+5. **Next** → en *Add permissions* **no** marques nada → **Next**.
+6. **Role name:** `sentinel-github-actions` → **Create role**.
+7. Abre el rol → pestaña **Trust relationships** → **Edit trust policy** → reemplaza todo con el contenido de [`infra/iam/trust-policy.json`](infra/iam/trust-policy.json) → **Update policy**. Así queda exactamente igual al archivo del repo, sin depender de lo que generó el asistente.
+
+**Paso 5: permisos del rol (política en línea)**
+1. En el rol → pestaña **Permissions** → **Add permissions** → **Create inline policy**.
+2. Cambia el editor a **JSON**, borra lo que haya y pega el contenido de [`infra/iam/s3-report-policy.json`](infra/iam/s3-report-policy.json).
+3. **Next** → nombre: `sentinel-s3-reports` → **Create policy**.
+4. En la página del rol, copia el **ARN** (arriba): `arn:aws:iam::146183084500:role/sentinel-github-actions`.
+
+**Paso 6: secrets en GitHub**
+1. GitHub → repo `sentinel-Framework` → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
+2. Crea dos secrets:
+
+| Name | Secret |
+|---|---|
+| `AWS_ROLE_ARN` | `arn:aws:iam::146183084500:role/sentinel-github-actions` |
+| `REPORT_BUCKET` | `sentinel-reports-millerpaez` |
+
+> Ninguno de los dos es una contraseña: sin el token OIDC de **este** repo no sirven para nada. Se guardan como secrets para no dejar el número de cuenta ni el nombre del bucket en el código ni en los logs.
+
+**Paso 7: probar**
+1. GitHub → **Actions** → **CI** → **Run workflow** (rama `main`).
+2. Cuando termine, revisa que los steps **Configure AWS credentials (OIDC)** y **Publish Cucumber report to S3** estén en verde.
+3. En el **Summary** de la ejecución aparece `Report published to s3://sentinel-reports-millerpaez/runs/<run_id>/`.
+
+### Cómo ver los reportes en S3
+1. Consola → **S3** → `sentinel-reports-millerpaez` → carpeta `runs/` → carpeta con el `run_id` (el mismo número que aparece en la URL de la ejecución en GitHub).
+2. Selecciona `index.html` → **Download** → ábrelo en el navegador. El reporte de Cucumber es un solo archivo HTML autocontenido, así que funciona sin conexión.
+
+El bucket es **privado**: no hay URL pública. Es intencional (sección 14, roadmap: "sitio estático público en S3").
+
+### El workflow, parte AWS
+```yaml
+- name: Configure AWS credentials (OIDC)
+  if: always() && github.event_name != 'pull_request'
+  uses: aws-actions/configure-aws-credentials@v6
+  with:
+    role-to-assume: ${{ secrets.AWS_ROLE_ARN }}   # qué rol asumir
+    aws-region: us-east-1
+
+- name: Publish Cucumber report to S3
+  if: always() && github.event_name != 'pull_request'
+  env:
+    REPORT_BUCKET: ${{ secrets.REPORT_BUCKET }}
+  run: |
+    if [ ! -d build/reports/cucumber ]; then exit 0; fi   # no hay reporte → nada que subir
+    aws s3 sync build/reports/cucumber "s3://${REPORT_BUCKET}/runs/${{ github.run_id }}/"
+```
+- `if: always()`: el reporte se publica **aunque las pruebas fallen**. Un monitor que solo guarda evidencia de los éxitos no sirve.
+- No hay ninguna llave en el YAML: `role-to-assume` es solo el **nombre** del rol. La "prueba de identidad" es el token OIDC, que la action pide sola.
+- `aws s3 sync` sube solo lo que no existe o cambió. Como cada ejecución usa una carpeta nueva (`runs/<run_id>/`), en la práctica sube todo y nunca sobrescribe ejecuciones anteriores.
+- La AWS CLI ya viene instalada en `ubuntu-latest`.
+
+### Costos
+Cada reporte pesa unos cientos de KB. Con una ejecución programada al día más los pushes, en un año son unos cientos de MB: centavos de dólar en S3. Las llamadas a IAM, STS y OIDC son gratuitas. El presupuesto de 5 USD es solo una red de seguridad.
+
+### Solución de problemas
+
+| Error en el log | Causa probable | Arreglo |
+|---|---|---|
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | El `sub` del token no coincide con la trust policy: mayúsculas (`sentinel-Framework`), rama distinta de `main`, o el proveedor OIDC no existe | Revisar el paso 3 y la pestaña *Trust relationships* del rol contra `trust-policy.json` |
+| `Credentials could not be loaded` / `Could not get ID token` | Falta `id-token: write` en `permissions` | Verificar el bloque `permissions` del workflow |
+| `Input required and not supplied: role-to-assume` | El secret `AWS_ROLE_ARN` no existe o tiene otro nombre | Paso 6 |
+| `AccessDenied ... s3:PutObject` | La política en línea no está adjunta, o el bucket o la ruta no coinciden | Paso 5; el ARN debe terminar en `/runs/*` |
+| `AccessDenied ... s3:ListBucket` | El ARN de `ListBucket` tiene `/*` o el nombre del bucket está mal | Debe ser exactamente `arn:aws:s3:::sentinel-reports-millerpaez` |
+| `NoSuchBucket` | El nombre en el secret `REPORT_BUCKET` no coincide con el bucket creado | Paso 2 y paso 6 |
+
+### Plan B: llaves IAM (solo si OIDC no funciona a tiempo)
+1. IAM → **Users** → **Create user** → nombre `sentinel-ci` → sin acceso a consola.
+2. **Permissions:** adjuntar como política en línea el mismo `s3-report-policy.json`.
+3. Usuario → **Security credentials** → **Create access key** → *Application running outside AWS* → copiar las dos llaves (solo se muestran una vez).
+4. GitHub secrets: `AWS_ACCESS_KEY_ID` y `AWS_SECRET_ACCESS_KEY`.
+5. En el workflow, cambiar `role-to-assume` por:
+   ```yaml
+   aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+   aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+   ```
+
+**Por qué es solo un plan B:** son llaves **permanentes**. Si se filtran, sirven hasta que alguien las revoque, y hay que rotarlas a mano. Con OIDC no existe nada que se pueda filtrar.
