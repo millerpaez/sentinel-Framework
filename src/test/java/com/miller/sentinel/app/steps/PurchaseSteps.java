@@ -64,7 +64,7 @@ public class PurchaseSteps {
     public void iPlaceTheOrderAndPayWithATestCard() {
         UserData user = context.getCreatedUser();
         orderPlacedPage = checkoutPage
-                .placeOrder("Sentinel synthetic order - safe to ignore")
+                .placeOrder()
                 .payWith(PaymentCard.testVisaFor(user.firstname() + " " + user.lastname()));
     }
 

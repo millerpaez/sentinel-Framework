@@ -14,8 +14,6 @@ public class CheckoutPage extends BasePage {
     private static final By DELIVERY_PHONE = By.cssSelector("#address_delivery .address_phone");
     private static final By TOTAL_AMOUNT =
             By.xpath("//tr[.//b[normalize-space()='Total Amount']]//p[contains(@class, 'cart_total_price')]");
-    private static final By ORDER_COMMENT = By.name("message");
-    private static final By PLACE_ORDER = By.cssSelector("a[href='/payment']");
 
     /** "Mr. Ana Probe": title, first name and last name as rendered by the site. */
     public String getDeliveryName() {
@@ -39,10 +37,13 @@ public class CheckoutPage extends BasePage {
         return Prices.parse(textOf(TOTAL_AMOUNT));
     }
 
-    public PaymentPage placeOrder(String comment) {
-        type(ORDER_COMMENT, comment);
-        scrollIntoView(PLACE_ORDER);
-        click(PLACE_ORDER);
+    /**
+     * "Place Order" is a plain link to /payment (the order comment is not inside any form, so the site never
+     * sends it). Clicking site links can trigger a full-screen Google ad that blocks the navigation, which
+     * happened in CI, so we follow the link's URL directly: same destination, no ad.
+     */
+    public PaymentPage placeOrder() {
+        openPath("/payment");
         return new PaymentPage();
     }
 }

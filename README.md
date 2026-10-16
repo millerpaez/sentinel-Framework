@@ -473,7 +473,9 @@ Decisiones de diseño:
 - **Los pages devuelven precios como `int`:** el sitio muestra `Rs. 1500` y la clase `Prices` (privada del paquete `pages`) lo convierte. Los steps comparan números, no textos.
 - **La dirección del checkout se valida contra el `UserData` creado por API** (título + nombre, ciudad/estado/código postal, país, teléfono) y el total contra el carrito. Usa **`SoftAssertions`** de AssertJ: si fallan varios campos, el reporte los muestra todos a la vez y no solo el primero.
 - **Tarjeta de prueba:** `4111 1111 1111 1111` es el número de prueba estándar de Visa y nunca puede cobrar a nadie (el sitio además no procesa pagos reales).
-- **Navegación por URL donde se puede** (`/product_details/1`, `/view_cart`) y clics reales donde el flujo lo exige ("Proceed To Checkout", "Place Order", "Pay").
+- **Navegación por URL donde se puede** (`/product_details/1`, `/view_cart`, `/payment`) y clics reales en los **botones** del flujo ("Add to cart", "Proceed To Checkout", "Pay and Confirm Order").
+
+**Segundo bug real, solo en CI: el anuncio "vignette" de Google.** En local el E2E pasaba, pero en GitHub Actions falló al pagar: el formulario de `/payment` nunca apareció. El **screenshot del reporte** mostró un anuncio de Google a pantalla completa (una encuesta) tapando la página. El sitio usa anuncios *vignette*, que se disparan al hacer clic en **links** (`<a href>`) y bloquean la navegación. Aparecen según la región: no desde Colombia, sí desde los servidores de GitHub en EE. UU. "Place Order" era un link a `/payment`, y además se comprobó en el HTML que el comentario del pedido **no está dentro de ningún formulario**, así que el sitio nunca lo envía. La solución fue la misma regla de la navegación directa: `placeOrder()` abre `/payment` por URL. El destino es idéntico y no hay anuncio. Los clics que quedan son **botones** o acciones JS, que no disparan la vignette.
 
 **Bug real encontrado al construirlo, una *race condition*:** la primera versión fallaba porque `loginAs()` devolvía `HomePage` justo después del clic, mientras el sitio todavía procesaba la redirección `/login` → `/`. El siguiente `driver.get("/product_details/1")` se ejecutaba en medio y la redirección pendiente lo sobrescribía: el navegador terminaba en la home (se veía en el screenshot del fallo). TC04 no lo detectaba porque su siguiente paso espera el header. La solución fue aplicar la regla del método fluido al pie de la letra: `loginAs()` **espera a que la URL sea `/`** (`waitForPath("/")` en `BasePage`) antes de devolver `HomePage`. **Un método fluido devuelve la página de destino cuando ya llegaste, no cuando hiciste clic.**
 
@@ -970,7 +972,7 @@ Cada reporte pesa unos cientos de KB. Con una ejecución programada al día más
 | **TestNG como runner, JUnit 5 para unit tests** | TestNG paraleliza escenarios con `@DataProvider(parallel = true)` y un solo número en `testng.xml`. JUnit 5 es el estándar para probar clases Java pequeñas. Cada motor en su propia tarea de Gradle (`acceptanceTest` / `test`), sin mezclarse | Dos frameworks de pruebas en el classpath y dos formas de configurarlos |
 | **`ThreadLocal` para el driver + PicoContainer para el estado** | Cada mecanismo resuelve un alcance distinto: hilo (navegador) y escenario (datos) | Hay que entender los dos y llamar siempre a `remove()` |
 | **Escenario híbrido (datos por API, validación por UI)** | Rápido y estable: la UI se usa solo para lo que se quiere validar | No valida el formulario de registro por UI (no es el objetivo del monitor) |
-| **Navegación directa por URL** (`/login`) | Los anuncios del sitio interceptan clics en el menú | No prueba la navegación por menú |
+| **Navegación directa por URL** (`/login`, `/payment`) | Los anuncios del sitio interceptan clics en links (en CI, una *vignette* de Google bloqueó "Place Order") | No prueba la navegación por links ni el menú |
 | **JavaScript solo donde WebDriver no llega** (scroll) | Leer o mover el scroll no existe en la API de WebDriver | Los clics por JS se evitan a propósito: esconderían elementos tapados |
 | **E2E de compra fuera de `@monitor`** | El monitor diario se mantiene corto y estable; el E2E corre en cada push | Una rotura del checkout se detecta en el próximo push, no a las 20:00 |
 | **`PageLoadStrategy.EAGER`** | No espera a que carguen anuncios y trackers: ejecución más rápida y estable | Hay que confiar en las esperas explícitas (que de todas formas son obligatorias) |
@@ -1047,11 +1049,12 @@ Solo para lo que la API de WebDriver no puede hacer: leer `window.pageYOffset`, 
 El nombre y el precio se leen de la página del producto y se guardan en `ScenarioContext` como un `CartItem` esperado. El carrito se compara contra ese record con un solo `isEqualTo`, la dirección del checkout contra el `UserData` creado por API, y el total contra el carrito. Si el catálogo cambia, la prueba sigue siendo válida.
 
 **16. ¿Qué fue lo más difícil o qué aprendiste?**
-Cuatro cosas que solo aparecieron al ejecutar contra sistemas reales:
+Cinco cosas que solo aparecieron al ejecutar contra sistemas reales:
 - **Gradle 9** no detecta el `@Test` heredado del runner de Cucumber. Se resolvió con `scanForTestClasses = false`, y el runner redeclara `runScenario` para que el IDE también lo vea.
 - **La API** distingue "parámetro ausente" (400) de "parámetro vacío" (404).
 - **OIDC:** el repo usa el `sub` **inmutable** de GitHub (con IDs numéricos), no el clásico. La primera ejecución falló con `Not authorized` hasta ajustar la trust policy.
 - **Una *race condition* en el login:** `loginAs()` devolvía la página antes de que terminara la redirección, y la siguiente navegación se perdía. El screenshot del fallo mostró el problema y se resolvió esperando la URL de destino (ver `@TC06`).
+- **Un fallo que solo ocurría en CI:** un anuncio *vignette* de Google, que solo aparece desde ciertas regiones, bloqueaba el clic en el link "Place Order". De nuevo, el screenshot adjunto al reporte lo mostró de inmediato, y se resolvió navegando por URL. Es la prueba de por qué el `@After` adjunta screenshots.
 
 ---
 
