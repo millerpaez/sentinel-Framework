@@ -24,9 +24,10 @@ public class LoginPage extends BasePage {
         return this;
     }
 
-    /** Logs in with valid credentials; the site redirects to the home page. */
+    /** Logs in with valid credentials; returns once the site's redirect to the home page has finished. */
     public HomePage loginAs(String email, String password) {
         submitCredentials(email, password);
+        waitForPath("/");
         return new HomePage();
     }
 

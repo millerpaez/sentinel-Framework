@@ -1,5 +1,6 @@
 package com.miller.sentinel.app.context;
 
+import com.miller.sentinel.app.data.CartItem;
 import com.miller.sentinel.app.data.UserData;
 import com.miller.sentinel.core.api.ApiResult;
 
@@ -13,6 +14,8 @@ public class ScenarioContext {
 
     private UserData createdUser;
     private ApiResult lastApiResult;
+    private CartItem expectedCartItem;
+    private int expectedProductId;
 
     public UserData getCreatedUser() {
         return createdUser;
@@ -32,5 +35,19 @@ public class ScenarioContext {
 
     public void setLastApiResult(ApiResult lastApiResult) {
         this.lastApiResult = lastApiResult;
+    }
+
+    /** What the user put in the cart, captured from the product page so later steps can compare against it. */
+    public CartItem getExpectedCartItem() {
+        return expectedCartItem;
+    }
+
+    public int getExpectedProductId() {
+        return expectedProductId;
+    }
+
+    public void setExpectedCartItem(int productId, CartItem expectedCartItem) {
+        this.expectedProductId = productId;
+        this.expectedCartItem = expectedCartItem;
     }
 }

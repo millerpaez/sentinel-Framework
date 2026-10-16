@@ -143,20 +143,22 @@ src/test/
 │   │   ├── ui/BasePage.java             # Esperas explícitas y acciones comunes
 │   │   └── api/ApiResult.java           # Normaliza respuestas (responseCode del body)
 │   ├── app/                       # Específico del sitio bajo prueba
-│   │   ├── pages/LoginPage.java, HomePage.java
+│   │   ├── pages/LoginPage.java, HomePage.java, ProductDetailsPage.java,
+│   │   │   CartPage.java, CheckoutPage.java, PaymentPage.java, OrderPlacedPage.java
 │   │   ├── pages/components/HeaderComponent.java
 │   │   ├── api/AutomationExerciseApi.java   # Todos los endpoints
-│   │   ├── data/UserData.java (record), UserBuilder.java (Builder + Datafaker)
+│   │   ├── data/UserData.java (record), UserBuilder.java (Builder + Datafaker),
+│   │   │   CartItem.java, PaymentCard.java (records)
 │   │   ├── context/ScenarioContext.java     # Estado por escenario (PicoContainer)
 │   │   ├── hooks/Hooks.java
-│   │   └── steps/ApiSteps.java, LoginSteps.java, CommonSteps.java
+│   │   └── steps/ApiSteps.java, LoginSteps.java, CommonSteps.java, HomeSteps.java, PurchaseSteps.java
 │   ├── runners/RunCucumberTest.java     # Cucumber sobre TestNG, escenarios en paralelo
 │   └── unit/core/ConfigTest.java, UserBuilderTest.java   # Unit tests (JUnit 5)
 └── resources/
     ├── config.properties, cucumber.properties, testng.xml
     └── features/
         ├── api/products.feature, api/verify_login.feature
-        └── ui/login.feature
+        └── ui/login.feature, ui/navigation.feature, ui/purchase.feature
 ```
 
 **`core` vs `app`:** `core` es infraestructura genérica (configuración, navegador, esperas, normalización de respuestas API) y no menciona el sitio bajo prueba. Para probar otro sitio se reemplaza `app` y `core` queda igual. `app` contiene todo lo que conoce automationexercise: páginas, locators, endpoints, datos, steps y hooks.
@@ -207,6 +209,13 @@ Antes de escribir cada locator se revisó el HTML real con `curl`:
 | Email / password / botón | `[data-qa='login-email' \| 'login-password' \| 'login-button']` | Atributos `data-qa` propios para automatización: no cambian con el diseño |
 | Error de login | `.login-form form p` → `Your email or password is incorrect!` | Respuesta real de un login inválido |
 | Usuario logueado | `//header//a[contains(., 'Logged in as')]/b` y `header a[href='/logout']` | Header real después de iniciar sesión |
+| Flecha de subir | `#scrollUp` | No está en el HTML: la crea el plugin `jquery.scrollUp` al bajar más de 300 px |
+| Producto (nombre, precio, cantidad) | `.product-information h2`, `.product-information > span > span`, `#quantity` | `/product_details/1` real |
+| Confirmación "Added!" | `#cartModal.show .modal-title` | `cart.js` agrega la clase `show` cuando el AJAX a `/add_to_cart` termina |
+| Fila del carrito | `#product-{id} .cart_description h4 / .cart_price / .cart_quantity / .cart_total` | Carrito real con 3 unidades |
+| Dirección de entrega | `#address_delivery .address_firstname / .address_city / .address_country_name / .address_phone` | Checkout real de un usuario creado por API |
+| Pago | `[data-qa='name-on-card' \| 'card-number' \| 'cvc' \| 'expiry-month' \| 'expiry-year' \| 'pay-button']` | Formulario real de `/payment` |
+| Orden confirmada | `[data-qa='order-placed']` → `Order Placed!` | Redirección real a `/payment_done/1500` |
 
 ---
 
@@ -406,6 +415,8 @@ Por eso `verifyLogin` **omite** los parámetros en blanco. En el `.feature`, una
 | `@TC02` Invalid login requests are rejected (sin email) | API | `@api` | 400 parámetro faltante |
 | `@TC03` Login with invalid credentials shows an error | UI | `@ui @smoke` | Mensaje de error y usuario sin sesión |
 | `@TC04` A user registered through the API can log in through the UI | **Híbrido** | `@ui @smoke @monitor` | Usuario creado por API, login por UI, header muestra `Logged in as <nombre>`, limpieza por API |
+| `@TC05` The scroll-up arrow takes the user back to the top of the home page | UI + **JavaScript** | `@ui` | Bajar al footer, sección "Subscription" visible, flecha de subir y página de vuelta arriba (`window.pageYOffset == 0`) |
+| `@TC06` A registered user buys a product from the product page to the order confirmation | **E2E** | `@ui @e2e` | Usuario por API → login → 3 unidades al carrito → carrito (nombre, precio, cantidad, total) → checkout (dirección = datos del usuario, total) → pago → "Order Placed!" → limpieza por API |
 
 **Significado de cada tag:**
 - `@TCxx`: ID único del escenario, para ejecutarlo solo (`-Dtags="@TC03"` o en el runner). Las dos filas del `Scenario Outline` comparten `@TC02`.
@@ -414,8 +425,57 @@ Por eso `verifyLogin` **omite** los parámetros en blanco. En el `.feature`, una
 - `@ui`: usa navegador.
 - `@smoke`: verificación rápida de lo esencial.
 - `@monitor`: lo que ejecuta el job programado una vez al día.
+- `@e2e`: flujo de negocio completo, de punta a punta.
 
 El híbrido **no** lleva `@api`, aunque prepare datos por API. Así `-Dtags="@api"` garantiza que no se abre Chrome.
+
+### `@TC05`: `JavascriptExecutor`, y cuándo usarlo
+La API de WebDriver no puede **leer la posición de scroll** ni **ordenar un scroll** a una coordenada. Para eso `BasePage` ejecuta JavaScript dentro de la página:
+
+```java
+private final JavascriptExecutor js = (JavascriptExecutor) driver;    // ChromeDriver implementa la interfaz
+
+protected void scrollToBottom() {
+    js.executeScript("window.scrollTo(0, document.body.scrollHeight);");
+}
+protected long scrollY() {   // JS devuelve Long o Double según el valor: se lee como Number
+    return ((Number) js.executeScript("return window.pageYOffset;")).longValue();
+}
+protected boolean waitUntilScrolledToTop() {   // espera explícita con una condición JS
+    wait.until(d -> scrollY() == 0); ...
+}
+protected void scrollIntoView(By locator) {   // centra el elemento: ningún anuncio fijo en los bordes lo tapa
+    js.executeScript("arguments[0].scrollIntoView({block: 'center'});", element);
+}
+```
+
+**Regla:** JavaScript **solo para lo que WebDriver no puede hacer**. Los clics y la escritura siguen pasando por WebDriver (`click`, `type`), porque simulan al usuario real: si un elemento está tapado o deshabilitado, la prueba **debe** fallar. Un `element.click()` por JS haría clic igual y escondería el bug.
+
+**Detalles del escenario:**
+- La flecha `#scrollUp` no existe en el HTML inicial: la crea el plugin `jquery.scrollUp` cuando la página baja más de 300 px. `click()` espera a que sea clickeable.
+- La subida es **animada** (300 ms). Por eso la página espera `scrollY == 0` con una espera explícita y no lee la posición inmediatamente (y no hay `Thread.sleep`).
+- Los helpers de JS viven en `core` (`BasePage`): son genéricos y sirven para cualquier sitio.
+
+### `@TC06`: compra de punta a punta
+```gherkin
+Given a new user is registered through the API
+And I log in through the UI with that user's credentials
+When I add 3 units of the product with id 1 to the cart
+Then the cart should show that product with the right quantity and total
+When I proceed to checkout
+Then the delivery address should match the registered user
+When I place the order and pay with a test card
+Then I should see the order confirmation
+```
+
+Decisiones de diseño:
+- **Los valores esperados no están fijos en el código:** el nombre y el precio se leen de la página del producto y se guardan en `ScenarioContext` como un `CartItem` esperado (`CartItem.expected(nombre, precio, cantidad)` calcula el total). El carrito se compara con **un solo `isEqualTo`** entre dos records. Si el sitio cambia el precio del producto, la prueba sigue siendo válida.
+- **Los pages devuelven precios como `int`:** el sitio muestra `Rs. 1500` y la clase `Prices` (privada del paquete `pages`) lo convierte. Los steps comparan números, no textos.
+- **La dirección del checkout se valida contra el `UserData` creado por API** (título + nombre, ciudad/estado/código postal, país, teléfono) y el total contra el carrito. Usa **`SoftAssertions`** de AssertJ: si fallan varios campos, el reporte los muestra todos a la vez y no solo el primero.
+- **Tarjeta de prueba:** `4111 1111 1111 1111` es el número de prueba estándar de Visa y nunca puede cobrar a nadie (el sitio además no procesa pagos reales).
+- **Navegación por URL donde se puede** (`/product_details/1`, `/view_cart`) y clics reales donde el flujo lo exige ("Proceed To Checkout", "Place Order", "Pay").
+
+**Bug real encontrado al construirlo, una *race condition*:** la primera versión fallaba porque `loginAs()` devolvía `HomePage` justo después del clic, mientras el sitio todavía procesaba la redirección `/login` → `/`. El siguiente `driver.get("/product_details/1")` se ejecutaba en medio y la redirección pendiente lo sobrescribía: el navegador terminaba en la home (se veía en el screenshot del fallo). TC04 no lo detectaba porque su siguiente paso espera el header. La solución fue aplicar la regla del método fluido al pie de la letra: `loginAs()` **espera a que la URL sea `/`** (`waitForPath("/")` en `BasePage`) antes de devolver `HomePage`. **Un método fluido devuelve la página de destino cuando ya llegaste, no cuando hiciste clic.**
 
 ### ¿Por qué el escenario híbrido?
 - **Preparar datos por API** tarda menos de un segundo y es estable. Registrar un usuario por UI son 3 pantallas y unos 15 campos, cada uno con riesgo de fallar por anuncios o por tiempos de carga.
@@ -443,7 +503,7 @@ HEADLESS=true ./gradlew test acceptanceTest   # todo, como en CI
 Reporte: abrir `build/reports/cucumber/index.html` en el navegador.
 
 ### Ejecutar un escenario o una suite específica (IDs `@TCxx`)
-Cada escenario tiene un **tag de ID único**: `@TC01` … `@TC04` (ver la tabla en "Escenarios y tags"). Para ejecutar solo uno, o una suite como `@smoke`:
+Cada escenario tiene un **tag de ID único**: `@TC01` … `@TC06` (ver la tabla en "Escenarios y tags"). Para ejecutar solo uno, o una suite como `@smoke`:
 
 **Desde el IDE (VS Code):** cambia el `tags` del runner y pulsa ▶ junto a la clase o al método `runScenario`:
 ```java
@@ -911,6 +971,8 @@ Cada reporte pesa unos cientos de KB. Con una ejecución programada al día más
 | **`ThreadLocal` para el driver + PicoContainer para el estado** | Cada mecanismo resuelve un alcance distinto: hilo (navegador) y escenario (datos) | Hay que entender los dos y llamar siempre a `remove()` |
 | **Escenario híbrido (datos por API, validación por UI)** | Rápido y estable: la UI se usa solo para lo que se quiere validar | No valida el formulario de registro por UI (no es el objetivo del monitor) |
 | **Navegación directa por URL** (`/login`) | Los anuncios del sitio interceptan clics en el menú | No prueba la navegación por menú |
+| **JavaScript solo donde WebDriver no llega** (scroll) | Leer o mover el scroll no existe en la API de WebDriver | Los clics por JS se evitan a propósito: esconderían elementos tapados |
+| **E2E de compra fuera de `@monitor`** | El monitor diario se mantiene corto y estable; el E2E corre en cada push | Una rotura del checkout se detecta en el próximo push, no a las 20:00 |
 | **`PageLoadStrategy.EAGER`** | No espera a que carguen anuncios y trackers: ejecución más rápida y estable | Hay que confiar en las esperas explícitas (que de todas formas son obligatorias) |
 | **Sin `Thread.sleep` ni waits implícitos** | Las esperas explícitas esperan **solo lo necesario** y fallan con un mensaje claro | `isVisible` espera hasta el timeout cuando el elemento no aparece (≈10 s en el caso negativo) |
 | **`ApiResult` normaliza las respuestas** | La API devuelve HTTP 200 con el código real en el body y `Content-Type: text/html` | Una capa más; si la API se arreglara, solo cambia `ApiResult` |
@@ -976,13 +1038,20 @@ Se registra en el reporte, pero **no** marca la prueba como fallida. Un problema
 El `@Before` registra en el reporte el nombre del hilo. Una ejecución real muestra `TestNG-PoolService-1`, `-2` y `-3`. El número de hilos se configura en un solo lugar: `data-provider-thread-count="3"` en `testng.xml`.
 
 **13. ¿Cómo ejecutas un solo escenario?**
-Cada escenario tiene un ID (`@TC01`…`@TC04`). Desde la terminal: `./gradlew acceptanceTest -Dtags="@TC03"`. Desde el IDE: se pone el tag en `tags` del runner y se pulsa ▶. Gradle siempre sobrescribe ese valor (por defecto con `not @ignore`), así que un tag olvidado en el runner nunca afecta a CI.
+Cada escenario tiene un ID (`@TC01`…`@TC06`). Desde la terminal: `./gradlew acceptanceTest -Dtags="@TC03"`. Desde el IDE: se pone el tag en `tags` del runner y se pulsa ▶. Gradle siempre sobrescribe ese valor (por defecto con `not @ignore`), así que un tag olvidado en el runner nunca afecta a CI.
 
-**14. ¿Qué fue lo más difícil o qué aprendiste?**
-Tres cosas que solo aparecieron al ejecutar contra sistemas reales:
+**14. ¿Cuándo usas `JavascriptExecutor` y cuándo no?**
+Solo para lo que la API de WebDriver no puede hacer: leer `window.pageYOffset`, hacer scroll a una coordenada o centrar un elemento en la pantalla (TC05). Nunca para hacer clic o escribir: `element.click()` por JS ignora si el elemento está tapado o deshabilitado, así que escondería exactamente los bugs que un usuario sí sufriría. Además, `executeScript` devuelve `Long` o `Double` según el valor, por eso se lee como `Number`.
+
+**15. ¿Cómo evitas valores fijos en el E2E de compra?**
+El nombre y el precio se leen de la página del producto y se guardan en `ScenarioContext` como un `CartItem` esperado. El carrito se compara contra ese record con un solo `isEqualTo`, la dirección del checkout contra el `UserData` creado por API, y el total contra el carrito. Si el catálogo cambia, la prueba sigue siendo válida.
+
+**16. ¿Qué fue lo más difícil o qué aprendiste?**
+Cuatro cosas que solo aparecieron al ejecutar contra sistemas reales:
 - **Gradle 9** no detecta el `@Test` heredado del runner de Cucumber. Se resolvió con `scanForTestClasses = false`, y el runner redeclara `runScenario` para que el IDE también lo vea.
 - **La API** distingue "parámetro ausente" (400) de "parámetro vacío" (404).
 - **OIDC:** el repo usa el `sub` **inmutable** de GitHub (con IDs numéricos), no el clásico. La primera ejecución falló con `Not authorized` hasta ajustar la trust policy.
+- **Una *race condition* en el login:** `loginAs()` devolvía la página antes de que terminara la redirección, y la siguiente navegación se perdía. El screenshot del fallo mostró el problema y se resolvió esperando la URL de destino (ver `@TC06`).
 
 ---
 
